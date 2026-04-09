@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "CHZZK Live Memo Marker",
+  "description": "Record live timestamps with notes and show markers on CHZZK VOD.",
+  "version": "0.1.0",
+  "permissions": [
+    "storage",
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://chzzk.naver.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chzzk.naver.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "메모 기록 보기 · CHZZK Memo",
+    "default_popup": "popup.html"
+  }
+}
