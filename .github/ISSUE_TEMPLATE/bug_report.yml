@@ -1,0 +1,59 @@
+name: Bug report
+description: 버그/오작동 제보
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        제보 감사합니다. 아래 항목을 채워주시면 원인 파악이 빨라집니다.
+  - type: textarea
+    id: summary
+    attributes:
+      label: 증상 요약
+      description: 무엇이 문제인지 간단히 적어주세요.
+      placeholder: 라이브 카테고리가 실제 값 대신 "게임"으로 기록됩니다.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 재현 절차
+      description: 순서대로 적어주세요.
+      placeholder: |
+        1. 치지직 라이브 페이지 접속
+        2. 확장 팝업 열기
+        3. 카테고리 자동 기록 확인
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 기대 결과
+      placeholder: 실제 카테고리명(예: 스타크래프트 : 리마스터)으로 기록되어야 함
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 실제 결과
+      placeholder: "게임"으로 기록됨
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: 환경 정보
+      description: OS/브라우저/확장 버전
+      placeholder: |
+        - OS: Windows 11
+        - Browser: Chrome 135.x
+        - Extension version: 0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 로그/스크린샷 (선택)
+      description: 콘솔 로그, 스크린샷, 영상 링크 등이 있으면 첨부해 주세요.

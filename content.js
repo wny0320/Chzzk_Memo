@@ -21,6 +21,13 @@ const CHZZK_MEMO_RESERVED_CODES = new Set([
 ]);
 
 const DEFAULT_MEMO_HOTKEY = {
+  altKey: false,
+  ctrlKey: false,
+  shiftKey: false,
+  metaKey: false,
+  code: "KeyN"
+};
+const LEGACY_DEFAULT_MEMO_HOTKEY = {
   altKey: true,
   ctrlKey: false,
   shiftKey: false,
@@ -55,6 +62,7 @@ let uiMounted = false;
 let markerRafId = null;
 let markerRenderTimer = null;
 let controlsHideTimer = null;
+let categoryWatchTimer = null;
 let lastMouseX = 0;
 let lastMouseY = 0;
 let toolsRelocateTimer = null;
@@ -900,6 +908,7 @@ async function onLocationChange() {
   setVodBlocker(false);
 
   stopCommentImportFeature();
+  stopCategoryWatch();
   stopVodMarkerLoop();
   clearToolsRelocateTimer();
   clearPlayerUiVisibilityListeners();
@@ -1000,6 +1009,13 @@ function isChzzkMemoCodeReserved(code) {
 
 function normalizeMemoHotkey(raw) {
   if (!raw || typeof raw !== "object") return { ...DEFAULT_MEMO_HOTKEY };
+  const isLegacyDefault =
+    Boolean(raw.altKey) === LEGACY_DEFAULT_MEMO_HOTKEY.altKey &&
+    Boolean(raw.ctrlKey) === LEGACY_DEFAULT_MEMO_HOTKEY.ctrlKey &&
+    Boolean(raw.shiftKey) === LEGACY_DEFAULT_MEMO_HOTKEY.shiftKey &&
+    Boolean(raw.metaKey) === LEGACY_DEFAULT_MEMO_HOTKEY.metaKey &&
+    String(raw.code || "") === LEGACY_DEFAULT_MEMO_HOTKEY.code;
+  if (isLegacyDefault) return { ...DEFAULT_MEMO_HOTKEY };
   let code =
     typeof raw.code === "string" && /^Key[A-Z]$|^Digit[0-9]$/.test(raw.code)
       ? raw.code
@@ -1578,8 +1594,37 @@ function getCurrentSecond() {
   return Math.max(0, Math.floor(video.currentTime));
 }
 
+function parseClockTextToSec(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return null;
+  const m = text.match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  const c = Number(m[3] || 0);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(c)) return null;
+  if (m[3] != null) return a * 3600 + b * 60 + c;
+  return a * 60 + b;
+}
+
+function getLiveElapsedSecondFromDom() {
+  const selectors = [
+    "span.video_information_count__Y05sI",
+    "span[class*='video_information_count']"
+  ];
+  for (const sel of selectors) {
+    for (const el of Array.from(document.querySelectorAll(sel))) {
+      const sec = parseClockTextToSec(el.textContent || "");
+      if (Number.isFinite(sec) && sec >= 0) return sec;
+    }
+  }
+  return null;
+}
+
 async function getTimelineSecond() {
   if (pageInfo.mode !== "live") return getCurrentSecond();
+  const elapsedFromDom = getLiveElapsedSecondFromDom();
+  if (Number.isFinite(elapsedFromDom)) return elapsedFromDom;
   const startMs = await getLiveStartMs();
   if (!startMs) return getCurrentSecond();
   return Math.max(0, Math.floor((Date.now() - startMs) / 1000));
@@ -2460,13 +2505,20 @@ async function ensureLiveCategoryOnJoin() {
 }
 
 function startCategoryWatch() {
-  window.setInterval(async () => {
+  if (categoryWatchTimer) return;
+  categoryWatchTimer = window.setInterval(async () => {
     if (pageInfo.mode !== "live") return;
     const detected = getCurrentCategoryText();
     if (!detected) return;
     const session = await ensureCurrentSession();
     await insertCategoryIfChanged(session, detected, await getTimelineSecond());
   }, 5000);
+}
+
+function stopCategoryWatch() {
+  if (!categoryWatchTimer) return;
+  clearInterval(categoryWatchTimer);
+  categoryWatchTimer = null;
 }
 
 function getCurrentCategoryText() {
@@ -2517,7 +2569,9 @@ function isValidCategoryText(v) {
 
 async function insertCategoryIfChanged(session, categoryText, sec) {
   if (!isValidCategoryText(categoryText)) return;
-  const lastCategory = (session.entries || [])
+  const sessions = await getSessions();
+  const latestSession = sessions.find((s) => s.sessionId === session.sessionId) || session;
+  const lastCategory = (latestSession.entries || [])
     .slice()
     .reverse()
     .find((e) => e.type === "category");

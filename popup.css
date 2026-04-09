@@ -311,6 +311,34 @@ select {
   margin-bottom: 10px;
 }
 
+.project-links {
+  margin-top: 6px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(55, 65, 81, 0.9);
+}
+
+.project-links-title {
+  margin: 0 0 6px;
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+.project-links-row {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #cbd5e1;
+}
+
+.project-links-row a {
+  color: #93c5fd;
+  text-decoration: none;
+}
+
+.project-links-row a:hover {
+  text-decoration: underline;
+}
+
 button {
   border: 0;
   border-radius: 8px;
