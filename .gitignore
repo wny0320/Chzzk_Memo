@@ -27,5 +27,5 @@ coverage/
 *.zip
 *.crx
 
-# Maintainer: local deploy checklist (copy from RELEASE_CHECKLIST.local.md.example)
-RELEASE_CHECKLIST.local.md
+# Maintainer-only notes (deploy cautions, todos, checklist — not tracked)
+README.local.md
