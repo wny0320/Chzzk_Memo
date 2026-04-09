@@ -26,3 +26,6 @@ coverage/
 # Archives
 *.zip
 *.crx
+
+# Maintainer: local deploy checklist (copy from RELEASE_CHECKLIST.local.md.example)
+RELEASE_CHECKLIST.local.md
