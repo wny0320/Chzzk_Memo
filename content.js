@@ -1607,17 +1607,84 @@ function parseClockTextToSec(raw) {
   return a * 60 + b;
 }
 
+/** 채팅/댓글 패널 안의 링크·텍스트는 카테고리 후보에서 제외 */
+function isLikelyChatOrCommentSubtree(el) {
+  if (!el || typeof el.closest !== "function") return false;
+  return Boolean(
+    el.closest(
+      "[class*='live_chat'], [class*='LiveChat'], [class*='chatting_list'], [class*='ChatList'], [class*='chat_list'], [class*='comment_list'], [class*='CommentList'], [class*='video_comment'], [data-testid*='chat']"
+    )
+  );
+}
+
+/** 라이브 상단/플레이어 인근의 게임·카테고리 표시 줄 (숲·치지직 변형 공통 후보) */
+function getLiveVideoInformationRoot() {
+  return (
+    document.querySelector("[class*='video_information_row']") ||
+    document.querySelector("[class*='video_information_status']") ||
+    document.querySelector("[class*='broadcast_information']") ||
+    null
+  );
+}
+
+/**
+ * 방송 경과 시각: `video_information` 인근에서만 찾고,
+ * 가능하면 "스트리밍 중" 등 라벨이 붙은 span을 우선(채팅·다른 UI의 시각 오인식 방지).
+ */
 function getLiveElapsedSecondFromDom() {
-  const selectors = [
+  const roots = Array.from(
+    document.querySelectorAll(
+      "[class*='video_information_row'], [class*='video_information_data'], [class*='video_information_status']"
+    )
+  );
+  const scopeEls = roots.length ? roots : [document.body];
+
+  const countSelectors = [
     "span.video_information_count__Y05sI",
     "span[class*='video_information_count']"
   ];
-  for (const sel of selectors) {
-    for (const el of Array.from(document.querySelectorAll(sel))) {
-      const sec = parseClockTextToSec(el.textContent || "");
-      if (Number.isFinite(sec) && sec >= 0) return sec;
+
+  const labeledClockRe = /스트리밍|streaming|broadcast|방송\s*중|on\s*air|live/i;
+
+  const trySpan = (el, requireLabel) => {
+    const t = (el.textContent || "").replace(/\u00a0/g, " ").trim();
+    if (!t) return null;
+    if (requireLabel && !labeledClockRe.test(t)) return null;
+    const sec = parseClockTextToSec(t);
+    if (!Number.isFinite(sec) || sec < 0) return null;
+    return sec;
+  };
+
+  for (const root of scopeEls) {
+    for (const sel of countSelectors) {
+      let list;
+      try {
+        list = Array.from(root.querySelectorAll(sel));
+      } catch (_) {
+        continue;
+      }
+      for (const el of list) {
+        const sec = trySpan(el, true);
+        if (sec != null) return sec;
+      }
     }
   }
+
+  for (const root of scopeEls) {
+    for (const sel of countSelectors) {
+      let list;
+      try {
+        list = Array.from(root.querySelectorAll(sel));
+      } catch (_) {
+        continue;
+      }
+      for (const el of list) {
+        const sec = trySpan(el, false);
+        if (sec != null) return sec;
+      }
+    }
+  }
+
   return null;
 }
 
@@ -1630,19 +1697,37 @@ async function getTimelineSecond() {
   return Math.max(0, Math.floor((Date.now() - startMs) / 1000));
 }
 
+/**
+ * 선호 선택자가 실패할 때만. 전역 키워드 스캔은 채팅·채팅창 닉네임과 충돌하므로 하지 않음.
+ */
 function getDefaultCategory() {
-  const categoryAnchors = Array.from(document.querySelectorAll("a[href*='/category/']"))
-    .map((el) => (el.textContent || "").trim())
-    .filter(Boolean)
-    .filter(isValidCategoryText);
-  if (categoryAnchors.length > 0) return categoryAnchors[0];
+  const root = getLiveVideoInformationRoot();
+  const scopes = root ? [root] : [];
 
-  const candidates = Array.from(document.querySelectorAll("a, span, div"))
-    .map((el) => (el.textContent || "").trim())
-    .filter(Boolean)
-    .filter((t) => t.length <= 25)
-    .filter(isValidCategoryText);
-  return candidates.find((t) => /종합게임|게임|음악|토크|스포츠|먹방|ASMR|Just Chatting|리그|발로란트|롤|LOL|LCK/i.test(t)) || "";
+  const collectFromScope = (scope) => {
+    const anchors = Array.from(scope.querySelectorAll("a[href*='/category/']")).filter(
+      (a) => !isLikelyChatOrCommentSubtree(a)
+    );
+    for (const el of anchors) {
+      const txt = (el.textContent || "").trim();
+      if (isValidCategoryText(txt)) return txt;
+    }
+    return "";
+  };
+
+  for (const scope of scopes) {
+    const hit = collectFromScope(scope);
+    if (hit) return hit;
+  }
+
+  const globalAnchors = Array.from(document.querySelectorAll("a[href*='/category/']")).filter(
+    (a) => !isLikelyChatOrCommentSubtree(a)
+  );
+  for (const el of globalAnchors) {
+    const txt = (el.textContent || "").trim();
+    if (isValidCategoryText(txt)) return txt;
+  }
+  return "";
 }
 
 function formatHms(sec) {
@@ -2522,27 +2607,68 @@ function stopCategoryWatch() {
 }
 
 function getCurrentCategoryText() {
-  const preferredSelectors = [
-    "em.video_information_game__18XV7 a",
-    "em[class*='video_information_game'] a",
-    "a[href*='/category/']"
-  ];
-  for (const sel of preferredSelectors) {
-    for (const el of Array.from(document.querySelectorAll(sel))) {
+  const infoRoot = getLiveVideoInformationRoot();
+
+  const trySelectorInRoot = (sel, root) => {
+    if (!root) return null;
+    let nodes;
+    try {
+      nodes = Array.from(root.querySelectorAll(sel));
+    } catch (_) {
+      return null;
+    }
+    for (const el of nodes) {
+      if (isLikelyChatOrCommentSubtree(el)) continue;
       const txt = (el.textContent || "").trim();
       if (isValidCategoryText(txt)) return txt;
     }
+    return null;
+  };
+
+  const trySelectorGlobal = (sel) => {
+    for (const el of Array.from(document.querySelectorAll(sel))) {
+      if (isLikelyChatOrCommentSubtree(el)) continue;
+      const txt = (el.textContent || "").trim();
+      if (isValidCategoryText(txt)) return txt;
+    }
+    return null;
+  };
+
+  const orderedGameLinkSelectors = [
+    "em.video_information_game__18XV7 a",
+    "em[class*='video_information_game'] a"
+  ];
+  for (const sel of orderedGameLinkSelectors) {
+    const inRoot = trySelectorInRoot(sel, infoRoot);
+    if (inRoot) return inRoot;
+    const g = trySelectorGlobal(sel);
+    if (g) return g;
   }
 
+  if (infoRoot) {
+    const inInfo = trySelectorInRoot("a[href*='/category/']", infoRoot);
+    if (inInfo) return inInfo;
+  }
+
+  const categoryGlobal = trySelectorGlobal("a[href*='/category/']");
+  if (categoryGlobal) return categoryGlobal;
+
   const keywords = ["카테고리", "Category"];
-  for (const el of Array.from(document.querySelectorAll("span,div,a"))) {
-    const txt = (el.textContent || "").trim();
-    if (!txt || txt.length > 40) continue;
-    if (keywords.includes(txt) && el.nextElementSibling) {
-      const next = (el.nextElementSibling.textContent || "").trim();
-      if (isValidCategoryText(next)) return next;
+  const labelScopes = infoRoot ? [infoRoot] : [];
+  if (!labelScopes.length) labelScopes.push(document.body);
+  for (const scope of labelScopes) {
+    for (const el of Array.from(scope.querySelectorAll("span, div"))) {
+      if (isLikelyChatOrCommentSubtree(el)) continue;
+      const txt = (el.textContent || "").trim();
+      if (!txt || txt.length > 40) continue;
+      if (!keywords.includes(txt)) continue;
+      const next = el.nextElementSibling;
+      if (!next) continue;
+      const nextTxt = (next.textContent || "").trim();
+      if (isValidCategoryText(nextTxt)) return nextTxt;
     }
   }
+
   return getDefaultCategory();
 }
 
