@@ -5,6 +5,10 @@ const ACTIVE_PAGE_CONTEXT_KEY = "chzzkActivePageContext";
 const CATEGORY_STATE_KEY = "chzzkCategoryState";
 const LIVE_START_CACHE_KEY = "chzzkLiveStartCache";
 const MEMO_HOTKEY_KEY = "chzzkMemoHotkey";
+/** 팝업에서 플레이어 메모·타임라인 연결 버튼 표시 여부 */
+const PLAYER_TOOLS_VISIBILITY_KEY = "chzzkPlayerToolsVisibility";
+/** 라이브 카테고리 자동 감지·자동 기록 (기본 ON) */
+const CATEGORY_AUTO_DETECT_KEY = "chzzkCategoryAutoDetect";
 
 /** 치지직 플레이어 기본 조작과 겹치는 키 — 단축키로 지정 불가 (Cheese-PIP 도킹 대상 `.pzp-pc` 영역과 동일하게 플레이어·하단바에서만 단축키 처리). */
 const CHZZK_MEMO_RESERVED_CODES = new Set([
@@ -55,6 +59,10 @@ const VOD_MARKER_MERGE_MAX_CENTER_PX = 52;
 const VOD_MARKER_MERGE_CENTER_SEC_CAP = 280;
 
 let memoHotkeyConfig = { ...DEFAULT_MEMO_HOTKEY };
+/** @type {{ showMemo: boolean, showBind: boolean }} */
+let playerToolsVisibility = { showMemo: true, showBind: true };
+/** @type {boolean} */
+let categoryAutoDetectEnabled = true;
 
 let pageInfo = getPageInfo();
 let lastHref = location.href;
@@ -63,6 +71,15 @@ let markerRafId = null;
 let markerRenderTimer = null;
 let controlsHideTimer = null;
 let categoryWatchTimer = null;
+/** 라이브 방송 시작 시각(ms) 지연 탐지 — JSON 삽입·레이아웃 전환 대비, 짧게만 동작 */
+let liveStartAnchorProbeCleanup = null;
+let liveStartProbeDebounceTimer = null;
+/** 라이브 업타임: JSON 재스캔·DOM 정지 감지용 주기 검증 */
+let liveStartPeriodicTimer = null;
+/** `{ at: ms, sec: number }` — DOM 경과 시각이 벽시계와 같이 흐르는지 샘플 */
+let liveUptimeSanitySample = null;
+/** `getLiveStartMs` storage 전 동일 라이브에 대한 메모리 캐시 */
+let memLiveStartCache = null;
 let lastMouseX = 0;
 let lastMouseY = 0;
 let toolsRelocateTimer = null;
@@ -153,11 +170,16 @@ function tearDownAfterInvalidExtensionContext() {
   try {
     chrome.storage.onChanged.removeListener(onMemoHotkeyStorageChanged);
     chrome.storage.onChanged.removeListener(onSessionsStorageChanged);
+    chrome.storage.onChanged.removeListener(onVodBindingStorageChanged);
+    chrome.storage.onChanged.removeListener(onPlayerToolsVisibilityStorageChanged);
+    chrome.storage.onChanged.removeListener(onCategoryAutoDetectStorageChanged);
   } catch (_) {
     /* ignore */
   }
   closeClusterPopover({ releaseMarkerHoverHold: true });
   stopCommentImportFeature();
+  stopLiveStartAnchorProbe();
+  stopLiveStartPeriodicValidation();
   stopVodMarkerLoop();
   clearToolsRelocateTimer();
   clearPlayerUiVisibilityListeners();
@@ -782,10 +804,15 @@ async function boot() {
   installNavigationApiHook();
   window.addEventListener("popstate", () => void onLocationChange().catch(handleExtensionAsyncError));
   await loadMemoHotkeyConfig();
+  await loadPlayerToolsVisibility();
+  await loadCategoryAutoDetect();
   if (isExtensionContextValid()) {
     try {
       chrome.storage.onChanged.addListener(onMemoHotkeyStorageChanged);
       chrome.storage.onChanged.addListener(onSessionsStorageChanged);
+      chrome.storage.onChanged.addListener(onVodBindingStorageChanged);
+      chrome.storage.onChanged.addListener(onPlayerToolsVisibilityStorageChanged);
+      chrome.storage.onChanged.addListener(onCategoryAutoDetectStorageChanged);
     } catch (_) {
       /* ignore */
     }
@@ -797,6 +824,8 @@ async function boot() {
   ensureVodBlocker();
 
   if (pageInfo.mode === "live") {
+    startLiveStartAnchorProbe();
+    startLiveStartPeriodicValidation();
     await ensureLiveCategoryOnJoin();
   }
   if (pageInfo.mode === "vod") {
@@ -899,9 +928,15 @@ async function onLocationChange() {
   ) {
     return;
   }
+  const previousLiveId = pageInfo.liveId;
   lastHref = href;
   pageInfo = fresh;
   if (!pageInfo.isChzzk) return;
+
+  if (pageInfo.mode !== "live" || pageInfo.liveId !== previousLiveId) {
+    memLiveStartCache = null;
+    liveUptimeSanitySample = null;
+  }
 
   document.getElementById("cmm-editor-panel")?.classList.remove("show");
   document.getElementById("cmm-bind-panel")?.classList.remove("show");
@@ -909,6 +944,8 @@ async function onLocationChange() {
 
   stopCommentImportFeature();
   stopCategoryWatch();
+  stopLiveStartAnchorProbe();
+  stopLiveStartPeriodicValidation();
   stopVodMarkerLoop();
   clearToolsRelocateTimer();
   clearPlayerUiVisibilityListeners();
@@ -922,6 +959,8 @@ async function onLocationChange() {
   await waitForVideo();
   mountPlayerTools();
   if (pageInfo.mode === "live") {
+    startLiveStartAnchorProbe();
+    startLiveStartPeriodicValidation();
     await ensureLiveCategoryOnJoin();
   }
   if (pageInfo.mode === "vod") {
@@ -1090,6 +1129,83 @@ function onSessionsStorageChanged(changes, area) {
   if (area !== "local" || !changes[STORAGE_KEY]) return;
   if (pageInfo.mode !== "vod") return;
   safeRenderVodMarkers();
+}
+
+/** 팝업에서 VOD–세션 연결만 바꾼 경우 마커·컨텍스트 갱신 */
+function onVodBindingStorageChanged(changes, area) {
+  if (area !== "local" || !changes[VOD_BINDING_KEY]) return;
+  if (pageInfo.mode !== "vod") return;
+  lastPublishedPageContextJson = "";
+  safeRenderVodMarkers();
+  void publishActivePageContext();
+}
+
+function normalizePlayerToolsVisibility(raw) {
+  if (!raw || typeof raw !== "object") return { showMemo: true, showBind: true };
+  return {
+    showMemo: raw.showMemo !== false,
+    showBind: raw.showBind !== false
+  };
+}
+
+async function loadPlayerToolsVisibility() {
+  if (!isExtensionContextValid()) return;
+  try {
+    const stored = await getStorage(PLAYER_TOOLS_VISIBILITY_KEY, null);
+    playerToolsVisibility = normalizePlayerToolsVisibility(stored);
+  } catch (e) {
+    handleExtensionAsyncError(e);
+    playerToolsVisibility = { showMemo: true, showBind: true };
+  }
+}
+
+function applyPlayerToolsVisibility() {
+  const wrap = document.getElementById("cmm-player-tools");
+  const memo = document.getElementById("cmm-open-memo");
+  const bind = document.getElementById("cmm-open-bind");
+  if (!wrap) return;
+  const vodUi = pageInfo.mode === "vod" && pageInfo.vodId;
+  if (memo) memo.classList.toggle("cmm-tool-suppressed", !playerToolsVisibility.showMemo);
+  if (bind) {
+    const showBind = Boolean(vodUi && playerToolsVisibility.showBind);
+    bind.classList.toggle("cmm-tool-suppressed", !showBind);
+  }
+  const memoOn = Boolean(memo && playerToolsVisibility.showMemo);
+  const bindOn = Boolean(bind && vodUi && playerToolsVisibility.showBind);
+  wrap.classList.toggle("cmm-tools-all-hidden", !memoOn && !bindOn);
+}
+
+function onPlayerToolsVisibilityStorageChanged(changes, area) {
+  if (area !== "local" || !changes[PLAYER_TOOLS_VISIBILITY_KEY]) return;
+  playerToolsVisibility = normalizePlayerToolsVisibility(changes[PLAYER_TOOLS_VISIBILITY_KEY].newValue);
+  applyPlayerToolsVisibility();
+}
+
+function normalizeCategoryAutoDetect(raw) {
+  return raw !== false;
+}
+
+async function loadCategoryAutoDetect() {
+  if (!isExtensionContextValid()) return;
+  try {
+    const stored = await getStorage(CATEGORY_AUTO_DETECT_KEY, true);
+    categoryAutoDetectEnabled = normalizeCategoryAutoDetect(stored);
+  } catch (e) {
+    handleExtensionAsyncError(e);
+    categoryAutoDetectEnabled = true;
+  }
+}
+
+function onCategoryAutoDetectStorageChanged(changes, area) {
+  if (area !== "local" || !changes[CATEGORY_AUTO_DETECT_KEY]) return;
+  categoryAutoDetectEnabled = normalizeCategoryAutoDetect(changes[CATEGORY_AUTO_DETECT_KEY].newValue);
+  if (!categoryAutoDetectEnabled) {
+    stopCategoryWatch();
+    return;
+  }
+  if (pageInfo.mode === "live") {
+    void ensureLiveCategoryOnJoin({ skipInitialDelay: true }).catch(handleExtensionAsyncError);
+  }
 }
 
 function applyMemoButtonLabels() {
@@ -1434,14 +1550,10 @@ function mountPlayerTools() {
       <span class="pzp-button__tooltip pzp-button__tooltip--top cmm-pzp-tooltip-memo"></span>
       <span class="pzp-ui-icon pzp-pc-setting-button__icon cmm-pzp-icon" aria-hidden="true">📄</span>
     </button>
-    ${
-      pageInfo.mode === "vod"
-        ? `<button type="button" id="cmm-open-bind" class="pzp-button pzp-pc-setting-button pzp-pc__setting-button pzp-pc-ui-button cmm-pzp-btn" aria-label="타임라인 연결">
+    <button type="button" id="cmm-open-bind" class="pzp-button pzp-pc-setting-button pzp-pc__setting-button pzp-pc-ui-button cmm-pzp-btn" aria-label="타임라인 연결">
       <span class="pzp-button__tooltip pzp-button__tooltip--top">타임라인 연결</span>
       <span class="pzp-ui-icon pzp-pc-setting-button__icon cmm-pzp-icon" aria-hidden="true">🔗</span>
-    </button>`
-        : ""
-    }
+    </button>
   `;
 
   const pzpTarget = findPzpBottomButtonsRight(video);
@@ -1463,6 +1575,7 @@ function mountPlayerTools() {
   document.getElementById("cmm-open-memo")?.addEventListener("click", () => openMemoEditor().catch(() => {}));
   document.getElementById("cmm-open-bind")?.addEventListener("click", openBindPanel);
   applyMemoButtonLabels();
+  applyPlayerToolsVisibility();
   lastBoundVideoEl = video;
   lastBoundVideoSrcKey = getVideoSourceKey(video);
 }
@@ -1607,6 +1720,16 @@ function parseClockTextToSec(raw) {
   return a * 60 + b;
 }
 
+/** API·JSON의 `2026-04-10 07:05:39` 형식 등 → UTC ms (로컬 해석) */
+function parseChzzkOpenDateStringToMs(s) {
+  const raw = String(s || "").trim();
+  if (!raw) return null;
+  const isoish = /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/.test(raw) ? raw.replace(/\s+/, "T") : raw;
+  const ms = Date.parse(isoish);
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  return ms;
+}
+
 /** 채팅/댓글 패널 안의 링크·텍스트는 카테고리 후보에서 제외 */
 function isLikelyChatOrCommentSubtree(el) {
   if (!el || typeof el.closest !== "function") return false;
@@ -1617,34 +1740,87 @@ function isLikelyChatOrCommentSubtree(el) {
   );
 }
 
-/** 라이브 상단/플레이어 인근의 게임·카테고리 표시 줄 (숲·치지직 변형 공통 후보) */
+/**
+ * 라이브 상단·플레이어 인근 정보 줄.
+ * 넓은 화면·전체 화면은 `live_information_player_*`, 일반은 `video_information_*` 등.
+ * 숨김·0크기 노드는 건너뛰어 잘못된 루트 선택을 줄인다.
+ */
 function getLiveVideoInformationRoot() {
+  const orderedSelectors = [
+    "[class*='live_information_player_wrapper']",
+    "[class*='live_information_player_information']",
+    "[class*='video_information_row']",
+    "[class*='video_information_status']",
+    "[class*='broadcast_information']",
+    "[class*='LiveBroadcast']",
+    "[class*='live_header']",
+    "[class*='LiveHeader']"
+  ];
+  for (const sel of orderedSelectors) {
+    for (const el of document.querySelectorAll(sel)) {
+      if (!el?.isConnected) continue;
+      try {
+        const st = getComputedStyle(el);
+        if (st.display === "none" || st.visibility === "hidden") continue;
+        const r = el.getBoundingClientRect();
+        if (r.width >= 4 && r.height >= 4) return el;
+      } catch (_) {
+        continue;
+      }
+    }
+  }
   return (
+    document.querySelector("[class*='live_information_player_wrapper']") ||
+    document.querySelector("[class*='live_information_player_information']") ||
     document.querySelector("[class*='video_information_row']") ||
     document.querySelector("[class*='video_information_status']") ||
     document.querySelector("[class*='broadcast_information']") ||
+    document.querySelector("[class*='LiveBroadcast']") ||
+    document.querySelector("[class*='live_header']") ||
+    document.querySelector("[class*='LiveHeader']") ||
     null
   );
 }
 
 /**
- * 방송 경과 시각: `video_information` 인근에서만 찾고,
- * 가능하면 "스트리밍 중" 등 라벨이 붙은 span을 우선(채팅·다른 UI의 시각 오인식 방지).
+ * 방송 경과 시각: `video_information`·`live_information_player` 인근에서만 찾고,
+ * 가능하면 "스트리밍 중" 등 라벨이 붙은 노드를 우선(채팅·다른 UI의 시각 오인식 방지).
  */
 function getLiveElapsedSecondFromDom() {
-  const roots = Array.from(
-    document.querySelectorAll(
-      "[class*='video_information_row'], [class*='video_information_data'], [class*='video_information_status']"
-    )
-  );
+  const rootSelectors = [
+    "[class*='video_information_row']",
+    "[class*='video_information_data']",
+    "[class*='video_information_status']",
+    "[class*='live_information_player_wrapper']",
+    "[class*='live_information_player_view']",
+    "[class*='live_information_player_information']",
+    "[class*='LiveBroadcast']",
+    "[class*='live_broadcast']",
+    "[class*='BroadcastSummary']",
+    "[class*='broadcast_summary']"
+  ];
+  const roots = [];
+  const seen = new Set();
+  for (const sel of rootSelectors) {
+    for (const el of document.querySelectorAll(sel)) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      roots.push(el);
+    }
+  }
   const scopeEls = roots.length ? roots : [document.body];
 
   const countSelectors = [
     "span.video_information_count__Y05sI",
-    "span[class*='video_information_count']"
+    "span[class*='video_information_count']",
+    "span[class*='live_information_player_count']",
+    "strong[class*='live_information_player_count']",
+    "[class*='live_status'] span",
+    "[class*='LiveStatus'] span"
   ];
 
-  const labeledClockRe = /스트리밍|streaming|broadcast|방송\s*중|on\s*air|live/i;
+  const labeledClockRe =
+    /스트리밍|streaming|broadcast|방송\s*중|on\s*air|\blive\b|라이브|경과|uptime|진행/i;
 
   const trySpan = (el, requireLabel) => {
     const t = (el.textContent || "").replace(/\u00a0/g, " ").trim();
@@ -1688,24 +1864,303 @@ function getLiveElapsedSecondFromDom() {
   return null;
 }
 
+/**
+ * JSON/HTML 청크에서 방송 시작 시각(ms). liveId가 있으면 해당 id 주변 슬라이스를 우선(다른 라이브 openDate 혼입 완화).
+ */
+function parseLiveOpenMsFromJsonChunk(text) {
+  if (!text || text.length < 12) return null;
+  const quotedRes = [
+    /"openDate"\s*:\s*"([^"]+)"/gi,
+    /"liveOpenDate"\s*:\s*"([^"]+)"/gi,
+    /"liveOpenAt"\s*:\s*"([^"]+)"/gi,
+    /"liveStartDate"\s*:\s*"([^"]+)"/gi,
+    /"broadcastStart(?:At|Date|Time)"\s*:\s*"([^"]+)"/gi,
+    /"live(?:Open|Start)(?:Date|At|Time)"\s*:\s*"([^"]+)"/gi,
+    /"start(?:Date|At|Time)"\s*:\s*"([^"]+)"/gi
+  ];
+  const now = Date.now();
+  for (const re of quotedRes) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const ms = parseChzzkOpenDateStringToMs(m[1]);
+      if (ms != null && ms <= now + 120000) return ms;
+    }
+  }
+  const epochRes = [
+    /"openDate"\s*:\s*(\d{13})/gi,
+    /"liveOpenDate"\s*:\s*(\d{13})/gi,
+    /"liveOpenAt"\s*:\s*(\d{13})/gi,
+    /"live(?:Open|Start)(?:Date|At|Time)"\s*:\s*(\d{13})/gi
+  ];
+  for (const re of epochRes) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > 1e12 && n <= now + 120000) return n;
+    }
+  }
+  return null;
+}
+
+function detectLiveStartMsFromDocument(liveId) {
+  const tryText = (raw) => {
+    if (!raw) return null;
+    const id = liveId != null ? String(liveId) : "";
+    if (id && raw.includes(id)) {
+      const idx = raw.indexOf(id);
+      const slice = raw.slice(Math.max(0, idx - 1600), Math.min(raw.length, idx + 1600));
+      const near = parseLiveOpenMsFromJsonChunk(slice);
+      if (near) return near;
+    }
+    return parseLiveOpenMsFromJsonChunk(raw);
+  };
+
+  const scripts = Array.from(
+    document.querySelectorAll("script[type='application/json'], script[type='application/ld+json'], script:not([src])")
+  );
+  let scanned = 0;
+  for (const s of scripts) {
+    const t = s.textContent;
+    if (!t || t.length < 24) continue;
+    if (!/openDate|liveOpen|broadcast|liveId|liveStart|startDate/i.test(t)) continue;
+    const v = tryText(t);
+    if (v) return v;
+    scanned += 1;
+    if (scanned >= 120) break;
+  }
+
+  const metaCandidates = Array.from(document.querySelectorAll("meta[content]"))
+    .map((m) => m.getAttribute("content") || "")
+    .filter((v) => /live|broadcast|openDate|start/i.test(v))
+    .slice(0, 40);
+  for (const t of metaCandidates) {
+    const v = tryText(t);
+    if (v) return v;
+  }
+
+  return null;
+}
+
+/** PZP 하단·슬라이더 등에서 경과 시각(초) — 넓은 화면에서 상단 정보 줄이 멈춰도 보조 */
+function getLiveElapsedSecondFromPzpUi() {
+  const scope = findPzpPlayerScope() || document;
+  const sels = [
+    ".pzp-pc__vod-time",
+    "[class*='pzp-pc__vod-time']",
+    "[class*='pzp-pc-ui-time']",
+    "[class*='pzp'][class*='__time']"
+  ];
+  for (const sel of sels) {
+    let els;
+    try {
+      els = scope.querySelectorAll(sel);
+    } catch (_) {
+      continue;
+    }
+    for (const el of els) {
+      const raw = (el.textContent || "").replace(/\u00a0/g, " ").trim();
+      if (!raw || raw.length > 96) continue;
+      const sec = parseClockTextToSec(raw);
+      if (Number.isFinite(sec) && sec >= 0 && sec < 3600 * 72) return sec;
+    }
+  }
+  const slider = scope.querySelector("[role='slider']");
+  const aria = (slider?.getAttribute("aria-valuetext") || "").trim();
+  if (aria.length > 2 && aria.length < 120) {
+    const sec = parseClockTextToSec(aria);
+    if (Number.isFinite(sec) && sec >= 0 && sec < 3600 * 72) return sec;
+  }
+  return null;
+}
+
+function deriveLiveStartMsFromDomElapsed() {
+  const sec = getLiveElapsedSecondFromDom();
+  if (!Number.isFinite(sec) || sec < 0) return null;
+  if (sec > 86400 * 3) return null;
+  return Date.now() - sec * 1000;
+}
+
+async function cacheLiveStartMs(ms) {
+  if (!pageInfo.liveId || !Number.isFinite(ms) || ms <= 0) return;
+  memLiveStartCache = { liveId: pageInfo.liveId, ms };
+  const cache = await getStorage(LIVE_START_CACHE_KEY, {});
+  cache[pageInfo.liveId] = ms;
+  await setStorage(LIVE_START_CACHE_KEY, cache);
+}
+
+function stopLiveStartAnchorProbe() {
+  liveStartAnchorProbeCleanup?.();
+  liveStartAnchorProbeCleanup = null;
+}
+
+/**
+ * 최대 ~14초, MutationObserver(디바운스) + 480ms 폴링. 성공 시 즉시 중단.
+ * API 호출 없이 지연 삽입 JSON·플레이어 DOM만 보조.
+ */
+function startLiveStartAnchorProbe() {
+  stopLiveStartAnchorProbe();
+  if (pageInfo.mode !== "live" || !pageInfo.liveId) return;
+
+  let cancelled = false;
+  let mo = null;
+  let iv = null;
+  let maxTo = null;
+
+  const finish = () => {
+    if (cancelled) return;
+    cancelled = true;
+    if (liveStartProbeDebounceTimer) {
+      clearTimeout(liveStartProbeDebounceTimer);
+      liveStartProbeDebounceTimer = null;
+    }
+    try {
+      mo?.disconnect();
+    } catch (_) {
+      /* ignore */
+    }
+    if (iv) clearInterval(iv);
+    if (maxTo) clearTimeout(maxTo);
+    iv = null;
+    maxTo = null;
+    liveStartAnchorProbeCleanup = null;
+  };
+
+  const tick = () => {
+    if (cancelled) return;
+    void getLiveStartMs()
+      .then((got) => {
+        if (got) finish();
+      })
+      .catch(() => {});
+  };
+
+  tick();
+
+  mo = new MutationObserver(() => {
+    if (cancelled) return;
+    if (liveStartProbeDebounceTimer) clearTimeout(liveStartProbeDebounceTimer);
+    liveStartProbeDebounceTimer = setTimeout(() => {
+      liveStartProbeDebounceTimer = null;
+      tick();
+    }, 160);
+  });
+  try {
+    mo.observe(document.documentElement, { childList: true, subtree: true });
+  } catch (_) {
+    finish();
+    return;
+  }
+
+  let n = 0;
+  iv = setInterval(() => {
+    if (cancelled) return;
+    n += 1;
+    tick();
+    if (n >= 22) finish();
+  }, 480);
+
+  maxTo = setTimeout(() => finish(), 14000);
+
+  liveStartAnchorProbeCleanup = finish;
+}
+
+function stopLiveStartPeriodicValidation() {
+  if (liveStartPeriodicTimer) {
+    clearInterval(liveStartPeriodicTimer);
+    liveStartPeriodicTimer = null;
+  }
+}
+
+async function invalidateLiveStartCacheForCurrentLive() {
+  const liveId = pageInfo.liveId;
+  if (!liveId) return;
+  memLiveStartCache = null;
+  const cache = await getStorage(LIVE_START_CACHE_KEY, {});
+  delete cache[liveId];
+  await setStorage(LIVE_START_CACHE_KEY, cache);
+  liveUptimeSanitySample = null;
+  const jsonMs = detectLiveStartMsFromDocument(liveId);
+  if (jsonMs) await cacheLiveStartMs(jsonMs);
+}
+
+/**
+ * 넓은 화면·전체 화면 등에서 DOM 업타임이 멈추거나 잘못 잡힌 뒤에도 계속 쓰이는 문제 완화:
+ * - 주기적으로 인라인 JSON의 방송 시작 시각을 다시 읽어 캐시와 크게 다르면 교체
+ * - DOM/PZP 경과 시각이 벽시계와 함께 증가하지 않으면 캐시를 비우고 JSON·DOM 재유도
+ */
+async function runLiveStartPeriodicValidation() {
+  if (pageInfo.mode !== "live" || !pageInfo.liveId) return;
+  const liveId = pageInfo.liveId;
+
+  let curMs = memLiveStartCache?.liveId === liveId ? memLiveStartCache.ms : null;
+  if (curMs == null) {
+    const cache = await getStorage(LIVE_START_CACHE_KEY, {});
+    curMs = cache[liveId] ?? null;
+  }
+
+  const jsonMs = detectLiveStartMsFromDocument(liveId);
+  if (jsonMs != null && (curMs == null || Math.abs(jsonMs - curMs) > 25000)) {
+    await cacheLiveStartMs(jsonMs);
+    liveUptimeSanitySample = null;
+    return;
+  }
+
+  const sec = getLiveElapsedSecondFromDom() ?? getLiveElapsedSecondFromPzpUi();
+  if (!Number.isFinite(sec) || sec < 0) return;
+
+  const now = Date.now();
+  if (liveUptimeSanitySample) {
+    const wallSec = (now - liveUptimeSanitySample.at) / 1000;
+    if (wallSec >= 28) {
+      const domDelta = sec - liveUptimeSanitySample.sec;
+      if (Math.abs(domDelta - wallSec) > 18) {
+        await invalidateLiveStartCacheForCurrentLive();
+        return;
+      }
+    }
+  }
+  liveUptimeSanitySample = { at: now, sec };
+}
+
+function startLiveStartPeriodicValidation() {
+  stopLiveStartPeriodicValidation();
+  if (pageInfo.mode !== "live" || !pageInfo.liveId) return;
+  void runLiveStartPeriodicValidation().catch(handleExtensionAsyncError);
+  liveStartPeriodicTimer = setInterval(() => {
+    void runLiveStartPeriodicValidation().catch(handleExtensionAsyncError);
+  }, 50000);
+}
+
 async function getTimelineSecond() {
   if (pageInfo.mode !== "live") return getCurrentSecond();
+  /* 라이브 HLS의 video.currentTime은 재생 세그먼트 위치라 방송 경과(01:54:38)와 무관 — 폴백 금지 */
   const elapsedFromDom = getLiveElapsedSecondFromDom();
-  if (Number.isFinite(elapsedFromDom)) return elapsedFromDom;
+  const fromPzp = getLiveElapsedSecondFromPzpUi();
   const startMs = await getLiveStartMs();
-  if (!startMs) return getCurrentSecond();
-  return Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+  if (Number.isFinite(startMs) && startMs > 0) {
+    const wall = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+    if (Number.isFinite(elapsedFromDom) && Math.abs(wall - elapsedFromDom) > 90) {
+      return elapsedFromDom;
+    }
+    return wall;
+  }
+  if (Number.isFinite(elapsedFromDom)) return elapsedFromDom;
+  if (Number.isFinite(fromPzp)) return fromPzp;
+  return 0;
 }
 
 /**
  * 선호 선택자가 실패할 때만. 전역 키워드 스캔은 채팅·채팅창 닉네임과 충돌하므로 하지 않음.
  */
 function getDefaultCategory() {
+  const catSel = "a[href*='/category/'], a[href*='chzzk.naver.com/category/']";
   const root = getLiveVideoInformationRoot();
   const scopes = root ? [root] : [];
 
   const collectFromScope = (scope) => {
-    const anchors = Array.from(scope.querySelectorAll("a[href*='/category/']")).filter(
+    const anchors = Array.from(scope.querySelectorAll(catSel)).filter(
       (a) => !isLikelyChatOrCommentSubtree(a)
     );
     for (const el of anchors) {
@@ -1720,7 +2175,7 @@ function getDefaultCategory() {
     if (hit) return hit;
   }
 
-  const globalAnchors = Array.from(document.querySelectorAll("a[href*='/category/']")).filter(
+  const globalAnchors = Array.from(document.querySelectorAll(catSel)).filter(
     (a) => !isLikelyChatOrCommentSubtree(a)
   );
   for (const el of globalAnchors) {
@@ -2178,9 +2633,34 @@ async function ensureCurrentSession() {
   };
 }
 
-/** 마커 호버 툴팁: 타임라인(시각) 없이 메모 본문만. 카테고리 마커는 툴팁 없음. */
-function markerHoverTipText(entry) {
-  if (entry.type === "category") return "";
+/**
+ * 세션 내 이전 카테고리 항목이 있고 이름이 다르면「카테고리 변경」, 첫 항목이면「카테고리」.
+ * 저장 `text`는 카테고리명만 유지하고, 마커·목록 표시용 라벨만 만든다.
+ */
+function findPreviousCategoryEntry(sortedEntries, entry) {
+  const ix = sortedEntries.findIndex((e) => e.id && entry.id && e.id === entry.id);
+  if (ix <= 0) return null;
+  for (let i = ix - 1; i >= 0; i--) {
+    if (sortedEntries[i].type === "category") return sortedEntries[i];
+  }
+  return null;
+}
+
+function categoryAutoMarkerLabel(entry, sortedEntries) {
+  if (entry.type !== "category") return "";
+  const name = (entry.text || "").trim();
+  if (!sortedEntries?.length) {
+    return name ? `카테고리 변경 · ${name}` : "카테고리 변경";
+  }
+  const prev = findPreviousCategoryEntry(sortedEntries, entry);
+  const isChange = prev && normalizeText(prev.text) !== normalizeText(name);
+  const headline = isChange ? "카테고리 변경" : "카테고리";
+  return name ? `${headline} · ${name}` : headline;
+}
+
+/** 마커 호버 툴팁: 메모는 본문만. 카테고리는「카테고리(변경) · 이름」. */
+function markerHoverTipText(entry, sortedEntries) {
+  if (entry.type === "category") return categoryAutoMarkerLabel(entry, sortedEntries);
   const t = (entry.text || "").trim();
   return t || "메모";
 }
@@ -2300,16 +2780,15 @@ function mergeVodMarkerGroupsByTimelinePixelBleed(groups, duration, barW, maxCen
 }
 
 /** 클러스터 팝오버 한 줄 라벨 */
-function clusterEntryLine(entry) {
+function clusterEntryLine(entry, sortedSessionEntries) {
   if (entry.type === "category") {
-    const t = (entry.text || "").trim();
-    return t ? `카테고리 · ${t}` : "카테고리";
+    return categoryAutoMarkerLabel(entry, sortedSessionEntries);
   }
   const t = (entry.text || "").trim();
   return t || "메모";
 }
 
-function openClusterPopover(anchorEl, items, video) {
+function openClusterPopover(anchorEl, items, video, sortedSessionEntries) {
   if (!anchorEl || !items?.length || !video) return;
   const existing = document.getElementById("cmm-marker-cluster-pop");
   if (existing && clusterPopoverAnchor === anchorEl) {
@@ -2323,11 +2802,11 @@ function openClusterPopover(anchorEl, items, video) {
   const pop = document.createElement("div");
   pop.id = "cmm-marker-cluster-pop";
   pop.setAttribute("role", "dialog");
-  pop.setAttribute("aria-label", "이 시간대 메모 목록");
+  pop.setAttribute("aria-label", "이 시간대 메모·카테고리 목록");
 
   const head = document.createElement("div");
   head.className = "cmm-cluster-pop-head";
-  head.textContent = `${items.length}개 · 항목을 눌러 이동`;
+  head.textContent = `${items.length}개 · 항목을 눌러 이동 (메모·카테고리)`;
   pop.appendChild(head);
 
   const list = document.createElement("div");
@@ -2344,7 +2823,7 @@ function openClusterPopover(anchorEl, items, video) {
 
     const textEl = document.createElement("span");
     textEl.className = "cmm-cluster-pop-text";
-    textEl.textContent = clusterEntryLine(entry);
+    textEl.textContent = clusterEntryLine(entry, sortedSessionEntries);
 
     row.appendChild(timeEl);
     row.appendChild(textEl);
@@ -2468,9 +2947,10 @@ async function renderVodMarkers() {
         const entry = group[0];
         dot.className = "cmm-marker";
         dot.style.left = `${left}%`;
-        const tip = markerHoverTipText(entry);
+        const tip = markerHoverTipText(entry, entries);
         if (tip) dot.dataset.cmmTip = tip;
         else dot.classList.add("cmm-marker--no-tip");
+        dot.setAttribute("aria-label", tip || "마커");
         dot.addEventListener("click", (e) => {
           e.stopPropagation();
           video.currentTime = entry.sec;
@@ -2480,7 +2960,7 @@ async function renderVodMarkers() {
         dot.className = "cmm-marker cmm-marker--cluster";
         dot.style.left = `${left}%`;
         dot.dataset.cmmTip = "클릭하여 펼치기";
-        dot.setAttribute("aria-label", `${group.length}개 메모, 클릭하여 펼치기`);
+        dot.setAttribute("aria-label", `${group.length}개 항목(메모·카테고리), 클릭하여 펼치기`);
         const badge = document.createElement("span");
         badge.className = "cmm-marker-cluster-badge";
         badge.textContent = String(group.length);
@@ -2488,7 +2968,7 @@ async function renderVodMarkers() {
         dot.addEventListener("click", (e) => {
           e.stopPropagation();
           e.preventDefault();
-          openClusterPopover(dot, group, video);
+          openClusterPopover(dot, group, video, entries);
         });
       }
       layer.appendChild(dot);
@@ -2574,13 +3054,31 @@ function toast(message) {
   setTimeout(() => el.remove(), 1500);
 }
 
-async function ensureLiveCategoryOnJoin() {
+/**
+ * @param {{ skipInitialDelay?: boolean }} [options]
+ * `skipInitialDelay`: 팝업에서 자동 감지를 다시 켠 직후 등, 긴 대기 없이 한 번 읽기.
+ */
+async function ensureLiveCategoryOnJoin(options = {}) {
+  if (!categoryAutoDetectEnabled) {
+    stopCategoryWatch();
+    return;
+  }
   const session = await ensureCurrentSession();
   // 라이브 진입 직후에는 카테고리 DOM이 이전 방송 값일 수 있어 잠시 대기 후 읽는다.
-  await delay(1200);
+  if (!options.skipInitialDelay) {
+    await delay(1200);
+  }
+  if (!categoryAutoDetectEnabled) {
+    stopCategoryWatch();
+    return;
+  }
   let detected = getCurrentCategoryText();
   if (!detected) {
     await delay(1000);
+    if (!categoryAutoDetectEnabled) {
+      stopCategoryWatch();
+      return;
+    }
     detected = getCurrentCategoryText();
   }
   if (detected) {
@@ -2590,8 +3088,10 @@ async function ensureLiveCategoryOnJoin() {
 }
 
 function startCategoryWatch() {
+  if (!categoryAutoDetectEnabled) return;
   if (categoryWatchTimer) return;
   categoryWatchTimer = window.setInterval(async () => {
+    if (!categoryAutoDetectEnabled) return;
     if (pageInfo.mode !== "live") return;
     const detected = getCurrentCategoryText();
     if (!detected) return;
@@ -2604,6 +3104,55 @@ function stopCategoryWatch() {
   if (!categoryWatchTimer) return;
   clearInterval(categoryWatchTimer);
   categoryWatchTimer = null;
+}
+
+/**
+ * 넓은 화면·전체 화면 등에서 카테고리 DOM이 비어 있을 때, 페이지 JSON의 표시용 카테고리명 사용.
+ */
+function parseLiveCategoryFromJsonChunk(text, liveId) {
+  if (!text || text.length < 24) return null;
+  const patterns = [
+    /"liveCategoryValue"\s*:\s*"([^"]*)"/gi,
+    /"categoryValue"\s*:\s*"([^"]*)"/gi
+  ];
+  const scan = (chunk) => {
+    for (const re of patterns) {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(chunk)) !== null) {
+        const t = (m[1] || "").trim();
+        if (isValidCategoryText(t)) return t;
+      }
+    }
+    return null;
+  };
+  if (liveId) {
+    const id = String(liveId);
+    if (text.includes(id)) {
+      const idx = text.indexOf(id);
+      const slice = text.slice(Math.max(0, idx - 2600), Math.min(text.length, idx + 2600));
+      const near = scan(slice);
+      if (near) return near;
+    }
+  }
+  return scan(text);
+}
+
+function detectLiveCategoryFromDocument(liveId) {
+  if (!liveId) return null;
+  let scanned = 0;
+  for (const s of document.querySelectorAll(
+    "script[type='application/json'], script[type='application/ld+json'], script:not([src])"
+  )) {
+    const t = s.textContent;
+    if (!t || t.length < 40) continue;
+    if (!/liveCategory|categoryValue/i.test(t)) continue;
+    const c = parseLiveCategoryFromJsonChunk(t, liveId);
+    if (c) return c;
+    scanned += 1;
+    if (scanned >= 60) break;
+  }
+  return null;
 }
 
 function getCurrentCategoryText() {
@@ -2636,7 +3185,10 @@ function getCurrentCategoryText() {
 
   const orderedGameLinkSelectors = [
     "em.video_information_game__18XV7 a",
-    "em[class*='video_information_game'] a"
+    "em[class*='video_information_game'] a",
+    "em[class*='live_information_game'] a",
+    "[class*='live_information_player_information'] a[href*='/category/']",
+    "[class*='live_information_player_information'] a[href*='chzzk.naver.com/category/']"
   ];
   for (const sel of orderedGameLinkSelectors) {
     const inRoot = trySelectorInRoot(sel, infoRoot);
@@ -2645,12 +3197,13 @@ function getCurrentCategoryText() {
     if (g) return g;
   }
 
+  const catLinkSel = "a[href*='/category/'], a[href*='chzzk.naver.com/category/']";
   if (infoRoot) {
-    const inInfo = trySelectorInRoot("a[href*='/category/']", infoRoot);
+    const inInfo = trySelectorInRoot(catLinkSel, infoRoot);
     if (inInfo) return inInfo;
   }
 
-  const categoryGlobal = trySelectorGlobal("a[href*='/category/']");
+  const categoryGlobal = trySelectorGlobal(catLinkSel);
   if (categoryGlobal) return categoryGlobal;
 
   const keywords = ["카테고리", "Category"];
@@ -2667,6 +3220,11 @@ function getCurrentCategoryText() {
       const nextTxt = (next.textContent || "").trim();
       if (isValidCategoryText(nextTxt)) return nextTxt;
     }
+  }
+
+  if (pageInfo.mode === "live" && pageInfo.liveId) {
+    const fromJson = detectLiveCategoryFromDocument(pageInfo.liveId);
+    if (fromJson) return fromJson;
   }
 
   return getDefaultCategory();
@@ -2707,7 +3265,14 @@ async function insertCategoryIfChanged(session, categoryText, sec) {
   }
   await appendEntry(session, "category", categoryText, sec);
   await setCategoryState(categoryText);
-  toast(`카테고리 자동기록: ${categoryText}`);
+  const isChange = Boolean(
+    lastCategory && normalizeText(lastCategory.text) !== normalizeText(categoryText)
+  );
+  toast(
+    isChange
+      ? `카테고리 변경 · ${categoryText}`
+      : `카테고리 · ${categoryText}`
+  );
 }
 
 function normalizeMemoDedupeText(v) {
@@ -2757,71 +3322,24 @@ async function appendEntry(session, type, text, sec) {
 
 async function getLiveStartMs() {
   if (pageInfo.mode !== "live" || !pageInfo.liveId) return null;
+  if (memLiveStartCache?.liveId === pageInfo.liveId) return memLiveStartCache.ms;
+
   const cache = await getStorage(LIVE_START_CACHE_KEY, {});
-  if (cache[pageInfo.liveId]) return cache[pageInfo.liveId];
-
-  const detected = detectLiveStartMsFromDom();
-  if (detected) {
-    cache[pageInfo.liveId] = detected;
-    await setStorage(LIVE_START_CACHE_KEY, cache);
-    return detected;
-  }
-  return null;
-}
-
-function detectLiveStartMsFromDom() {
-  const parseStartMsFromText = (text) => {
-    if (!text) return null;
-    const isoRegexes = [
-      /"live(Open|Start)(Date|At|Time)"\s*:\s*"([^"]+)"/i,
-      /"broadcast(Open|Start)(Date|At|Time)"\s*:\s*"([^"]+)"/i,
-      /"start(Date|At|Time)"\s*:\s*"([^"]+)"/i
-    ];
-    for (const re of isoRegexes) {
-      const m = text.match(re);
-      const dateStr = m?.[3];
-      if (!dateStr) continue;
-      const ms = Date.parse(dateStr);
-      if (Number.isFinite(ms) && ms > 0) return ms;
-    }
-
-    const epochRegexes = [
-      /"live(Open|Start)(Date|At|Time)"\s*:\s*(\d{13})/i,
-      /"broadcast(Open|Start)(Date|At|Time)"\s*:\s*(\d{13})/i,
-      /"start(Date|At|Time)"\s*:\s*(\d{13})/i
-    ];
-    for (const re of epochRegexes) {
-      const m = text.match(re);
-      const ms = Number(m?.[3] || 0);
-      if (Number.isFinite(ms) && ms > 0) return ms;
-    }
-    return null;
-  };
-
-  /* 전체 innerHTML 스캔 대신, 데이터가 있을 가능성이 높은 script 텍스트만 제한적으로 확인 */
-  const scriptCandidates = [];
-  const nextData = document.getElementById("__NEXT_DATA__");
-  if (nextData?.textContent) scriptCandidates.push(nextData.textContent);
-  for (const s of Array.from(document.querySelectorAll("script[type='application/json'], script[type='application/ld+json'], script"))) {
-    const t = s.textContent;
-    if (!t || t.length < 16) continue;
-    if (!/live|broadcast|start/i.test(t)) continue;
-    scriptCandidates.push(t);
-    if (scriptCandidates.length >= 30) break;
-  }
-  for (const t of scriptCandidates) {
-    const ms = parseStartMsFromText(t);
-    if (ms) return ms;
+  if (cache[pageInfo.liveId]) {
+    memLiveStartCache = { liveId: pageInfo.liveId, ms: cache[pageInfo.liveId] };
+    return cache[pageInfo.liveId];
   }
 
-  /* 최후 폴백: 메타 태그 값 일부만 확인 */
-  const metaCandidates = Array.from(document.querySelectorAll("meta[content]"))
-    .map((m) => m.getAttribute("content") || "")
-    .filter((v) => /live|broadcast|start/i.test(v))
-    .slice(0, 40);
-  for (const t of metaCandidates) {
-    const ms = parseStartMsFromText(t);
-    if (ms) return ms;
+  const fromJson = detectLiveStartMsFromDocument(pageInfo.liveId);
+  if (fromJson) {
+    await cacheLiveStartMs(fromJson);
+    return fromJson;
+  }
+
+  const fromDomElapsed = deriveLiveStartMsFromDomElapsed();
+  if (fromDomElapsed) {
+    await cacheLiveStartMs(fromDomElapsed);
+    return fromDomElapsed;
   }
 
   return null;

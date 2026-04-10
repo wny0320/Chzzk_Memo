@@ -46,6 +46,14 @@
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
 }
 
+#cmm-player-tools .cmm-tool-suppressed {
+  display: none !important;
+}
+
+#cmm-player-tools.cmm-tools-all-hidden {
+  display: none !important;
+}
+
 /* VOD 마커 툴팁(플로우차트형 캡슐) — 버튼은 pzp 네이티브 툴팁 사용 */
 .cmm-marker::after {
   content: attr(data-cmm-tip);

@@ -2,6 +2,9 @@ const STORAGE_KEY = "chzzkMemoSessions";
 const VOD_BINDING_KEY = "chzzkVodBindings";
 const ACTIVE_PAGE_CONTEXT_KEY = "chzzkActivePageContext";
 const MEMO_HOTKEY_KEY = "chzzkMemoHotkey";
+const PLAYER_TOOLS_VISIBILITY_KEY = "chzzkPlayerToolsVisibility";
+const DEFAULT_PLAYER_TOOLS_VISIBILITY = { showMemo: true, showBind: true };
+const CATEGORY_AUTO_DETECT_KEY = "chzzkCategoryAutoDetect";
 
 const CHZZK_MEMO_RESERVED_CODES = new Set([
   "ArrowLeft",
@@ -42,6 +45,13 @@ const saveHotkeyBtn = document.getElementById("save-hotkey-btn");
 const hotkeySaved = document.getElementById("hotkey-saved");
 const sortDescCheck = document.getElementById("sort-desc");
 const sortAscCheck = document.getElementById("sort-asc");
+const popupVodSection = document.getElementById("popup-vod-bind-section");
+const popupVodHint = document.getElementById("popup-vod-bind-hint");
+const popupBindVodBtn = document.getElementById("popup-bind-vod-btn");
+const popupBindStatus = document.getElementById("popup-bind-status");
+const floatToggleMemo = document.getElementById("float-toggle-memo");
+const floatToggleBind = document.getElementById("float-toggle-bind");
+const categoryAutoDetectCheck = document.getElementById("category-auto-detect");
 
 let sessions = [];
 /** @type {typeof DEFAULT_MEMO_HOTKEY | null} */
@@ -49,6 +59,28 @@ let workingHotkey = { ...DEFAULT_MEMO_HOTKEY };
 let hkCapturing = false;
 let editingEntryId = null;
 let entrySortOrder = "asc";
+
+function normalizeCategoryKey(v) {
+  return String(v || "").replace(/\s+/g, "").toLowerCase();
+}
+
+function findPrevCategoryInSorted(sortedEntries, entry) {
+  const ix = sortedEntries.findIndex((e) => e.id && entry.id && e.id === entry.id);
+  if (ix <= 0) return null;
+  for (let i = ix - 1; i >= 0; i--) {
+    if (sortedEntries[i].type === "category") return sortedEntries[i];
+  }
+  return null;
+}
+
+/** 목록·기 표시용: 세션 시간순 기준 첫 카테고리 vs 이후 변경 구분(content.js 마커와 동일 규칙). */
+function categoryEntryTypeLabel(entry, sortedEntries) {
+  if (entry.type !== "category") return "메모";
+  const name = (entry.text || "").trim();
+  const prev = findPrevCategoryInSorted(sortedEntries, entry);
+  const isChange = Boolean(prev && normalizeCategoryKey(prev.text) !== normalizeCategoryKey(name));
+  return isChange ? "카테고리 변경" : "카테고리";
+}
 
 function groupSessionsByStreamer(list) {
   const out = {};
@@ -361,6 +393,8 @@ function renderEntryList() {
     entryListEl.appendChild(empty);
     return;
   }
+  /** 카테고리「변경」판별은 방송 타임라인(시간) 순서 기준 — 목록 정렬(오름/내림)과 무관 */
+  const sortedAsc = entries.slice().sort((a, b) => a.sec - b.sec);
   const sorted = entries
     .slice()
     .sort((a, b) => (entrySortOrder === "asc" ? a.sec - b.sec : b.sec - a.sec));
@@ -373,7 +407,8 @@ function renderEntryList() {
       meta.className = "entry-row-meta";
       const typeEl = document.createElement("span");
       typeEl.className = "entry-type";
-      typeEl.textContent = e.type === "category" ? "카테고리" : "메모";
+      typeEl.textContent =
+        e.type === "category" ? categoryEntryTypeLabel(e, sortedAsc) : "메모";
       meta.append(typeEl);
 
       const fields = document.createElement("div");
@@ -396,7 +431,8 @@ function renderEntryList() {
       const textLabel = document.createElement("label");
       textLabel.className = "entry-field-label";
       textLabel.setAttribute("for", `cmm-edit-text-${e.id}`);
-      textLabel.textContent = e.type === "category" ? "카테고리 이름" : "메모 내용";
+      textLabel.textContent =
+        e.type === "category" ? "표시되는 카테고리 이름" : "메모 내용";
 
       const textInput = document.createElement("input");
       textInput.type = "text";
@@ -450,7 +486,7 @@ function renderEntryList() {
       if (e.type === "category") {
         const typeEl = document.createElement("span");
         typeEl.className = "entry-type";
-        typeEl.textContent = "카테고리";
+        typeEl.textContent = categoryEntryTypeLabel(e, sortedAsc);
         main.append(timeEl, typeEl, textEl);
       } else {
         main.append(timeEl, textEl);
@@ -523,7 +559,8 @@ async function onSaveEntry(sessionId, entryId, text, timeRaw) {
 
 async function onDeleteEntry(sessionId, entry) {
   const ok = await openConfirmModal(
-    "이 기록(메모 또는 카테고리)을 삭제합니다. 되돌릴 수 없습니다. 정말 삭제할까요?"
+    "이 기록(메모 또는 카테고리)을 삭제합니다. 되돌릴 수 없습니다. 정말 삭제할까요?",
+    { okLabel: "삭제", danger: true }
   );
   if (!ok) return;
 
@@ -703,7 +740,8 @@ async function onDeleteSession() {
   const session = getSelectedSession();
   if (!session) return;
   const ok = await openConfirmModal(
-    "선택한 세션과 그 안의 모든 기록을 삭제합니다. 이 작업은 되돌릴 수 없습니다. 정말 삭제할까요?"
+    "선택한 세션과 그 안의 모든 기록을 삭제합니다. 이 작업은 되돌릴 수 없습니다. 정말 삭제할까요?",
+    { okLabel: "삭제", danger: true }
   );
   if (!ok) return;
 
@@ -748,7 +786,174 @@ function getStorage(key, fallback) {
   });
 }
 
-function openConfirmModal(message) {
+function normalizePlayerToolsVisibility(raw) {
+  if (!raw || typeof raw !== "object") return { ...DEFAULT_PLAYER_TOOLS_VISIBILITY };
+  return {
+    showMemo: raw.showMemo !== false,
+    showBind: raw.showBind !== false
+  };
+}
+
+async function loadFloatTogglesFromStorage() {
+  const v = normalizePlayerToolsVisibility(
+    await getStorage(PLAYER_TOOLS_VISIBILITY_KEY, DEFAULT_PLAYER_TOOLS_VISIBILITY)
+  );
+  if (floatToggleMemo) floatToggleMemo.setAttribute("aria-pressed", v.showMemo ? "true" : "false");
+  if (floatToggleBind) floatToggleBind.setAttribute("aria-pressed", v.showBind ? "true" : "false");
+}
+
+async function loadCategoryAutoDetectFromStorage() {
+  const raw = await getStorage(CATEGORY_AUTO_DETECT_KEY, true);
+  const on = raw !== false;
+  if (categoryAutoDetectCheck) {
+    categoryAutoDetectCheck.checked = on;
+    categoryAutoDetectCheck.setAttribute("aria-checked", on ? "true" : "false");
+  }
+}
+
+/** 활성 탭 URL 또는 콘텐츠 스크립트가 저장한 컨텍스트로 VOD id 판별 */
+async function resolveActiveVodForPopup() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab?.url) {
+      try {
+        const u = new URL(tab.url);
+        if (/chzzk\.naver\.com$/i.test(u.hostname)) {
+          const m = u.pathname.match(/^\/video\/([^/?#]+)/);
+          if (m) return { vodId: m[1], href: tab.url, source: "tab" };
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  } catch {
+    /* tabs 권한·내부 페이지 등 */
+  }
+  const ctx = await getStorage(ACTIVE_PAGE_CONTEXT_KEY, null);
+  if (ctx && ctx.mode === "vod" && ctx.vodId) {
+    return { vodId: ctx.vodId, href: ctx.href || "", source: "context" };
+  }
+  return null;
+}
+
+async function refreshPopupVodBindPanel() {
+  if (!popupVodSection || !popupVodHint || !popupBindVodBtn) return;
+  const vod = await resolveActiveVodForPopup();
+  if (!vod) {
+    popupVodHint.textContent =
+      "치지직 VOD(/video/…) 재생 탭을 연 뒤 팝업을 열면 여기서 타임라인을 연결할 수 있습니다. (탭 URL을 읽지 못하면 방금 본 페이지 정보로 시도합니다.)";
+    popupBindVodBtn.disabled = true;
+    return;
+  }
+  popupBindVodBtn.disabled = false;
+  const shortId = vod.vodId.length > 14 ? `${vod.vodId.slice(0, 14)}…` : vod.vodId;
+  const src = vod.source === "context" ? "페이지 컨텍스트" : "현재 탭";
+  popupVodHint.textContent = `${src} 기준 VOD입니다 (영상 ${shortId}). 위에서 스트리머·세션을 고른 뒤 「연결」을 누르세요.`;
+}
+
+function isImportSourceSession(session) {
+  if (!session) return false;
+  if (session.source === "import") return true;
+  return String(session.sessionId || "").startsWith("import:");
+}
+
+/** 브라우저 탭 제목·컨텍스트의 CHZZK 접미사 제거 후 스트리머·방송 제목 분리 */
+function parseChzzkPageTitleForSession(raw) {
+  const t = String(raw || "")
+    .replace(/\s+-\s+CHZZK.*$/i, "")
+    .trim();
+  if (!t) return null;
+  const sep = " - ";
+  const i = t.indexOf(sep);
+  if (i >= 0) {
+    const left = t.slice(0, i).trim();
+    const right = t.slice(i + sep.length).trim();
+    return {
+      streamerName: left || t,
+      broadcastTitle: right || t,
+      displayTitle: t
+    };
+  }
+  return { streamerName: t, broadcastTitle: t, displayTitle: t };
+}
+
+async function getVodPageMetaForPopup(vod) {
+  if (!vod?.vodId) return null;
+  let raw = "";
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tab?.title) raw = tab.title;
+  } catch {
+    /* ignore */
+  }
+  if (!raw) {
+    const ctx = await getStorage(ACTIVE_PAGE_CONTEXT_KEY, null);
+    if (ctx && ctx.vodId === vod.vodId && ctx.pageTitle) raw = ctx.pageTitle;
+  }
+  return parseChzzkPageTitleForSession(raw);
+}
+
+async function applyVodMetaToImportSessionInStorage(sessionId, vodId, meta) {
+  const list = await getStorage(STORAGE_KEY, []);
+  const idx = list.findIndex((s) => s.sessionId === sessionId);
+  if (idx < 0) return false;
+  const s = { ...list[idx] };
+  if (meta.streamerName) s.streamerName = meta.streamerName;
+  if (meta.displayTitle) s.title = meta.displayTitle;
+  s.sourceId = vodId;
+  s.updatedAt = Date.now();
+  list[idx] = s;
+  await chrome.storage.local.set({ [STORAGE_KEY]: list });
+  return true;
+}
+
+async function onPopupBindVod() {
+  if (popupBindStatus) popupBindStatus.textContent = "";
+  const vod = await resolveActiveVodForPopup();
+  if (!vod) {
+    if (popupBindStatus) popupBindStatus.textContent = "치지직 VOD 페이지가 열린 탭에서 팝업을 열어주세요.";
+    return;
+  }
+  const sessionId = sessionSelect.value;
+  if (!sessionId) {
+    if (popupBindStatus) popupBindStatus.textContent = "연결할 세션을 먼저 선택하세요.";
+    return;
+  }
+  const session = sessions.find((s) => s.sessionId === sessionId);
+  if (isImportSourceSession(session)) {
+    const preview = await getVodPageMetaForPopup(vod);
+    const detail = preview
+      ? `현재 VOD 탭 기준으로 세션 정보를 다음처럼 맞춥니다.\n스트리머: ${preview.streamerName}\n세션 제목(방송 제목): ${preview.broadcastTitle || preview.displayTitle}\n\n`
+      : "현재 VOD 탭 제목을 읽을 수 있으면 스트리머·세션 제목을 그에 맞게 바꿉니다.\n\n";
+    const ok = await openConfirmModal(
+      `${detail}브라우저(확장 프로그램 저장소)에만 반영되며, 원본으로 가져온 TXT 파일 자체는 자동으로 바뀌지 않습니다. 갱신된 목록은 「TXT Export」로 다시 저장할 수 있습니다.\n\n이대로 연결할까요?`,
+      { okLabel: "연결하기", danger: false }
+    );
+    if (!ok) return;
+  }
+
+  const bindings = await getStorage(VOD_BINDING_KEY, {});
+  bindings[vod.vodId] = sessionId;
+  await chrome.storage.local.set({ [VOD_BINDING_KEY]: bindings });
+
+  if (session && isImportSourceSession(session)) {
+    const meta = await getVodPageMetaForPopup(vod);
+    if (meta?.displayTitle) {
+      await applyVodMetaToImportSessionInStorage(sessionId, vod.vodId, meta);
+      await reloadSessionsFromStorage();
+    }
+  }
+
+  if (popupBindStatus) {
+    popupBindStatus.textContent = isImportSourceSession(session)
+      ? "연결 및 세션 정보 반영이 완료되었습니다. TXT Export로 파일을 다시 저장할 수 있습니다."
+      : "타임라인 연결이 저장되었습니다. VOD 탭에서 마커가 갱신됩니다.";
+  }
+}
+
+function openConfirmModal(message, options = {}) {
+  const okLabel = options.okLabel ?? "확인";
+  const danger = options.danger === true;
   return new Promise((resolve) => {
     const modal = document.getElementById("cmm-confirm-modal");
     const msgEl = document.getElementById("cmm-confirm-message");
@@ -759,6 +964,9 @@ function openConfirmModal(message) {
       return;
     }
     msgEl.textContent = message;
+    okBtn.textContent = okLabel;
+    okBtn.classList.remove("btn-danger", "btn-primary");
+    okBtn.classList.add(danger ? "btn-danger" : "btn-primary");
     modal.hidden = false;
 
     function cleanup() {
@@ -899,6 +1107,34 @@ async function init() {
   });
   applyEntrySortUi();
 
+  await loadFloatTogglesFromStorage();
+  await loadCategoryAutoDetectFromStorage();
+  await refreshPopupVodBindPanel();
+
+  categoryAutoDetectCheck?.addEventListener("change", async () => {
+    const on = categoryAutoDetectCheck.checked;
+    categoryAutoDetectCheck.setAttribute("aria-checked", on ? "true" : "false");
+    await chrome.storage.local.set({ [CATEGORY_AUTO_DETECT_KEY]: on });
+  });
+
+  floatToggleMemo?.addEventListener("click", async () => {
+    const cur = normalizePlayerToolsVisibility(
+      await getStorage(PLAYER_TOOLS_VISIBILITY_KEY, DEFAULT_PLAYER_TOOLS_VISIBILITY)
+    );
+    const next = { ...cur, showMemo: !cur.showMemo };
+    await chrome.storage.local.set({ [PLAYER_TOOLS_VISIBILITY_KEY]: next });
+    floatToggleMemo.setAttribute("aria-pressed", next.showMemo ? "true" : "false");
+  });
+  floatToggleBind?.addEventListener("click", async () => {
+    const cur = normalizePlayerToolsVisibility(
+      await getStorage(PLAYER_TOOLS_VISIBILITY_KEY, DEFAULT_PLAYER_TOOLS_VISIBILITY)
+    );
+    const next = { ...cur, showBind: !cur.showBind };
+    await chrome.storage.local.set({ [PLAYER_TOOLS_VISIBILITY_KEY]: next });
+    floatToggleBind.setAttribute("aria-pressed", next.showBind ? "true" : "false");
+  });
+  popupBindVodBtn?.addEventListener("click", () => void onPopupBindVod());
+
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
     if (changes[MEMO_HOTKEY_KEY]) {
@@ -910,12 +1146,19 @@ async function init() {
     if (changes[ACTIVE_PAGE_CONTEXT_KEY]) {
       void applyActivePageContextSelection(changes[ACTIVE_PAGE_CONTEXT_KEY].newValue);
     }
+    if (changes[PLAYER_TOOLS_VISIBILITY_KEY]) {
+      void loadFloatTogglesFromStorage();
+    }
+    if (changes[CATEGORY_AUTO_DETECT_KEY]) {
+      void loadCategoryAutoDetectFromStorage();
+    }
   });
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
     void (async () => {
       await applyActivePageContextSelection(await getStorage(ACTIVE_PAGE_CONTEXT_KEY, null));
+      await refreshPopupVodBindPanel();
     })();
   });
 }

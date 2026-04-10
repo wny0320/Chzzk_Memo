@@ -1,15 +1,33 @@
-body {
+/* 확장 팝업에서 vh는 브라우저 창이 아니라 팝업 레이아웃 기준이라 본문이 거의 안 보이는 현상이 난다. px + flex만 사용. */
+html {
+  height: auto;
+  max-height: none;
+}
+
+body,
+.popup-body {
   margin: 0;
   font-family: Arial, sans-serif;
   background: #0b1020;
   color: #e5e7eb;
 }
 
-main {
+.popup-body {
+  display: flex;
+  flex-direction: column;
   width: 360px;
-  max-height: 580px;
+  max-height: 600px;
+  min-height: 0;
+  box-sizing: border-box;
+}
+
+main {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: hidden;
   overflow-y: auto;
   padding: 12px;
+  padding-bottom: 10px;
   box-sizing: border-box;
 }
 
@@ -69,6 +87,25 @@ h1 {
   min-height: 1.2em;
   font-size: 11px;
   color: #fbbf24;
+}
+
+.cmm-checkbox-setting {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0;
+  font-size: 13px;
+  color: #e5e7eb;
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.cmm-checkbox-setting input {
+  margin: 2px 0 0;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  accent-color: #38bdf8;
 }
 
 #hk-capture.active {
@@ -362,6 +399,15 @@ button.btn-secondary:hover {
   background: #4b5563;
 }
 
+button.btn-primary {
+  background: #2563eb;
+  color: #fff;
+}
+
+button.btn-primary:hover {
+  background: #1d4ed8;
+}
+
 .cmm-modal-overlay {
   position: fixed;
   inset: 0;
@@ -393,6 +439,7 @@ button.btn-secondary:hover {
   font-size: 13px;
   line-height: 1.5;
   color: #e5e7eb;
+  white-space: pre-line;
 }
 
 .cmm-modal-actions {
@@ -403,4 +450,63 @@ button.btn-secondary:hover {
 
 .cmm-modal-actions button {
   min-width: 72px;
+}
+
+/* 플레이어 하단 메모·연결 버튼 표시 (팝업 하단 고정, 확장 팝업에서 잘리지 않도록 fixed 미사용) */
+.popup-footer-tools {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding: 8px 12px 10px;
+  border-top: 1px solid #374151;
+  background: #070b14;
+  box-sizing: border-box;
+}
+
+.popup-footer-tools-label {
+  font-size: 10px;
+  color: #9ca3af;
+  line-height: 1.3;
+}
+
+.popup-footer-tools-btns {
+  display: flex;
+  gap: 6px;
+  width: 100%;
+}
+
+.footer-tool-btn {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid #4b5563;
+  border-radius: 8px;
+  background: #1f2937;
+  color: #e5e7eb;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.footer-tool-btn:hover {
+  background: #374151;
+}
+
+.footer-tool-btn[aria-pressed="false"] {
+  opacity: 0.45;
+  color: #9ca3af;
+}
+
+.vod-bind-panel .popup-bind-status {
+  margin: 6px 0 0;
+  min-height: 1.2em;
+  font-size: 11px;
+  color: #6ee7b7;
+}
+
+#popup-bind-vod-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
