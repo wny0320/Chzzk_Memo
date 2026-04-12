@@ -29,6 +29,7 @@ coverage/
 
 # Maintainer-only notes (deploy cautions, todos, checklist — not tracked)
 README.local.md
+CWS_SUBMISSION_GUIDE.md
 
 # Cursor — 로컬 전용 규칙·설정 (이 저장소에서만 쓰는 에이전트 규칙 등)
 .cursor/
