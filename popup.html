@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CHZZK Memo</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body class="popup-body">
+    <main>
+      <h1 class="cmm-dock-hide">CHZZK Memo</h1>
+      <p class="hint cmm-dock-hide">
+        치지직에서 저장한 메모·카테고리를 스트리머·세션별로 관리하고, 기록을 수정·삭제하거나 TXT로 복사·보내기·가져오기 할 수 있습니다.
+      </p>
+      <div class="popup-dock-row cmm-dock-hide" id="popup-dock-row">
+        <button type="button" id="open-standalone-popup-btn" class="btn-secondary popup-dock-btn">
+          별도 창으로 열기
+        </button>
+        <span class="popup-dock-hint">툴바 팝업은 바깥 클릭 시 닫힙니다. 이 창은 닫기 전까지 유지됩니다.</span>
+      </div>
+
+      <section class="panel-block cmm-dock-hide">
+        <h2 class="section-title">메모 단축키</h2>
+        <p class="hint small">
+          「키 조합 입력」을 누른 뒤 단축키를 한 번 누릅니다. 수정 키 없이 한 글자만 지정할 수도 있습니다. 방향키·K·스페이스·M·T·F·J는 치지직 기본 조작과 겹쳐 지정할 수 없습니다. Esc로 취소합니다.
+        </p>
+        <div class="hotkey-display" id="hk-display">—</div>
+        <div class="actions tight hotkey-actions">
+          <button type="button" id="hk-capture" class="btn-secondary">키 조합 입력</button>
+          <button type="button" id="save-hotkey-btn">저장</button>
+          <span id="hotkey-saved" class="saved-msg" hidden>저장됨</span>
+        </div>
+        <p class="hk-status" id="hk-status" aria-live="polite"></p>
+      </section>
+
+      <section class="panel-block cmm-dock-hide">
+        <h2 class="section-title">라이브 카테고리 / 방송 제목 자동 감지</h2>
+        <p class="hint small">
+          켜 두면 일반(기본) 화면에서 방송 카테고리나 방제(탭 제목의 방송 제목)가 바뀔 때 세션에 카테고리 형식으로 자동 기록합니다. 끄면 해당 줄은 추가되지 않으며, 메모만 수동으로 적을 수 있습니다. (이미 저장된 기록은 그대로입니다.)
+        </p>
+        <label class="cmm-checkbox-setting">
+          <input type="checkbox" id="category-auto-detect" checked />
+          <span>카테고리·방제 자동 감지 사용</span>
+        </label>
+      </section>
+
+      <label class="field-label" for="streamer-select">스트리머</label>
+      <div class="select-wrap">
+        <select id="streamer-select"></select>
+      </div>
+
+      <label class="field-label" for="session-select">세션 (방송 제목만 표시)</label>
+      <div class="session-block">
+        <div class="select-wrap">
+          <select id="session-select"></select>
+        </div>
+        <div class="session-actions-row">
+          <button type="button" id="rename-session-btn" class="btn-secondary session-action-btn">이름 수정</button>
+          <button type="button" id="new-session-btn" class="btn-secondary session-action-btn">새 세션</button>
+          <button type="button" id="delete-session-btn" class="btn-danger session-action-btn">세션 삭제</button>
+        </div>
+      </div>
+
+      <p class="preview-label">기록 목록</p>
+      <div class="entry-sort-row">
+        <label><input type="checkbox" id="sort-desc" /> 늦은순</label>
+        <label><input type="checkbox" id="sort-asc" checked /> 빠른순</label>
+      </div>
+      <div id="entry-list" class="entry-list"></div>
+
+      <div class="actions cmm-dock-hide">
+        <button id="copy-btn">Copy</button>
+        <button id="export-btn">TXT Export</button>
+        <button id="import-btn">TXT Import</button>
+        <input id="import-file" type="file" accept=".txt,text/plain" hidden />
+      </div>
+
+      <section class="panel-block vod-bind-panel cmm-dock-hide" id="popup-vod-bind-section">
+        <h2 class="section-title">현재 탭 VOD 타임라인</h2>
+        <p class="hint small" id="popup-vod-bind-hint"></p>
+        <div class="actions tight">
+          <button type="button" id="popup-bind-vod-btn">선택한 세션으로 연결</button>
+        </div>
+        <p class="popup-bind-status" id="popup-bind-status" aria-live="polite"></p>
+      </section>
+
+      <section class="project-links cmm-dock-hide" aria-label="프로젝트 링크">
+        <p class="project-links-title">프로젝트 / 문의</p>
+        <p class="project-links-row">
+          <a href="https://github.com/wny0320/Chzzk_Memo" target="_blank" rel="noopener noreferrer">GitHub 저장소</a>
+          <span aria-hidden="true">·</span>
+          <a href="https://github.com/wny0320/Chzzk_Memo/issues" target="_blank" rel="noopener noreferrer">이슈 목록</a>
+          <span aria-hidden="true">·</span>
+          <a href="https://github.com/wny0320/Chzzk_Memo/issues/new" target="_blank" rel="noopener noreferrer">이슈 등록</a>
+        </p>
+      </section>
+    </main>
+
+    <footer
+      class="popup-footer-tools cmm-dock-hide"
+      role="toolbar"
+      aria-label="치지직 플레이어 하단 버튼 표시"
+      title="VOD(/video)에서만 타임라인 연결(🔗) 아이콘이 보입니다. 라이브에는 메모만 해당됩니다."
+    >
+      <span class="popup-footer-tools-label">플레이어 표시 · 메모 / 연결(VOD만)</span>
+      <div class="popup-footer-tools-btns">
+        <button type="button" class="footer-tool-btn" id="float-toggle-memo" title="메모 버튼" aria-pressed="true">
+          메모
+        </button>
+        <button type="button" class="footer-tool-btn" id="float-toggle-bind" title="타임라인 연결 버튼 (VOD)" aria-pressed="true">
+          연결
+        </button>
+      </div>
+    </footer>
+
+    <div id="cmm-confirm-modal" class="cmm-modal-overlay" hidden>
+      <div class="cmm-modal" role="dialog" aria-modal="true" aria-labelledby="cmm-confirm-message">
+        <p id="cmm-confirm-message" class="cmm-modal-message"></p>
+        <div class="cmm-modal-actions">
+          <button type="button" id="cmm-confirm-cancel" class="btn-secondary">취소</button>
+          <button type="button" id="cmm-confirm-ok" class="btn-primary">확인</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="cmm-prompt-modal" class="cmm-modal-overlay" hidden>
+      <div class="cmm-modal" role="dialog" aria-modal="true" aria-labelledby="cmm-prompt-message">
+        <p id="cmm-prompt-message" class="cmm-modal-message"></p>
+        <input
+          type="text"
+          id="cmm-prompt-input"
+          class="cmm-modal-input"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <div class="cmm-modal-actions">
+          <button type="button" id="cmm-prompt-cancel" class="btn-secondary">취소</button>
+          <button type="button" id="cmm-prompt-ok" class="btn-primary">확인</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
