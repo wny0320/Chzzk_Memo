@@ -4,6 +4,8 @@ const VOD_BINDING_KEY = "chzzkVodBindings";
 const ACTIVE_PAGE_CONTEXT_KEY = "chzzkActivePageContext";
 const CATEGORY_STATE_KEY = "chzzkCategoryState";
 const LIVE_START_CACHE_KEY = "chzzkLiveStartCache";
+const LIVE_START_CACHE_PREFIX = "live:";
+const LIVE_START_CACHE_VALIDATE_DRIFT_MS = 25000;
 const MEMO_HOTKEY_KEY = "chzzkMemoHotkey";
 /** 팝업에서 플레이어 메모·타임라인 연결 버튼 표시 여부 */
 const PLAYER_TOOLS_VISIBILITY_KEY = "chzzkPlayerToolsVisibility";
@@ -87,7 +89,7 @@ let liveStartProbeDebounceTimer = null;
 let liveStartPeriodicTimer = null;
 /** `{ at: ms, sec: number }` — DOM 경과 시각이 벽시계와 같이 흐르는지 샘플 */
 let liveUptimeSanitySample = null;
-/** `getLiveStartMs` storage 전 동일 라이브에 대한 메모리 캐시 */
+/** `getLiveStartMs` storage 전 동일 라이브+방송키에 대한 메모리 캐시 */
 let memLiveStartCache = null;
 let lastMouseX = 0;
 let lastMouseY = 0;
@@ -2178,11 +2180,52 @@ function deriveLiveStartMsFromDomElapsed() {
   return Date.now() - sec * 1000;
 }
 
+function isFiniteLiveStartMs(ms) {
+  return typeof ms === "number" && Number.isFinite(ms) && ms > 0;
+}
+
+/** liveId + 현재 방송 제목 키(스트리머 접두 제외) 기반 캐시 키 */
+function buildLiveStartCacheScope(liveId = pageInfo.liveId) {
+  const id = String(liveId || "").trim();
+  const fallbackTitle = document.title.replace(/\s+-\s+CHZZK.*/i, "").trim();
+  const episodeKey = episodeKeyFromMemoTitle(fallbackTitle) || normalizeMemoTitleForMatch(fallbackTitle) || "untitled";
+  const keySafe = episodeKey.replace(/[^\p{L}\p{N}_-]+/gu, "_").slice(0, 120) || "untitled";
+  return {
+    liveId: id,
+    episodeKey: keySafe,
+    scopedKey: `${LIVE_START_CACHE_PREFIX}${id}:${keySafe}`
+  };
+}
+
+function readLiveStartMsFromCacheEntry(entry) {
+  if (isFiniteLiveStartMs(entry)) return Number(entry);
+  if (entry && typeof entry === "object" && isFiniteLiveStartMs(entry.ms)) return Number(entry.ms);
+  return null;
+}
+
+function readScopedLiveStartMsFromCache(cache, liveId = pageInfo.liveId) {
+  const scope = buildLiveStartCacheScope(liveId);
+  if (!scope.liveId) return { ms: null, cacheKey: null };
+  const scoped = readLiveStartMsFromCacheEntry(cache?.[scope.scopedKey]);
+  if (scoped != null) return { ms: scoped, cacheKey: scope.scopedKey };
+  const legacy = readLiveStartMsFromCacheEntry(cache?.[scope.liveId]);
+  if (legacy != null) return { ms: legacy, cacheKey: scope.liveId };
+  return { ms: null, cacheKey: null };
+}
+
 async function cacheLiveStartMs(ms) {
-  if (!pageInfo.liveId || !Number.isFinite(ms) || ms <= 0) return;
-  memLiveStartCache = { liveId: pageInfo.liveId, ms };
+  const scope = buildLiveStartCacheScope();
+  if (!scope.liveId || !isFiniteLiveStartMs(ms)) return;
+  memLiveStartCache = { liveId: scope.liveId, cacheKey: scope.scopedKey, ms };
   const cache = await getStorage(LIVE_START_CACHE_KEY, {});
-  cache[pageInfo.liveId] = ms;
+  cache[scope.scopedKey] = {
+    ms,
+    liveId: scope.liveId,
+    episodeKey: scope.episodeKey,
+    updatedAt: Date.now()
+  };
+  // 구버전( liveId 단일 키 ) 데이터와의 호환을 위해 최신값도 유지
+  cache[scope.liveId] = ms;
   await setStorage(LIVE_START_CACHE_KEY, cache);
 }
 
@@ -2275,6 +2318,10 @@ async function invalidateLiveStartCacheForCurrentLive() {
   memLiveStartCache = null;
   const cache = await getStorage(LIVE_START_CACHE_KEY, {});
   delete cache[liveId];
+  const prefix = `${LIVE_START_CACHE_PREFIX}${liveId}:`;
+  for (const k of Object.keys(cache)) {
+    if (k.startsWith(prefix)) delete cache[k];
+  }
   await setStorage(LIVE_START_CACHE_KEY, cache);
   liveUptimeSanitySample = null;
   const jsonMs = detectLiveStartMsFromDocument(liveId);
@@ -2289,15 +2336,26 @@ async function invalidateLiveStartCacheForCurrentLive() {
 async function runLiveStartPeriodicValidation() {
   if (pageInfo.mode !== "live" || !pageInfo.liveId) return;
   const liveId = pageInfo.liveId;
+  const scope = buildLiveStartCacheScope(liveId);
 
-  let curMs = memLiveStartCache?.liveId === liveId ? memLiveStartCache.ms : null;
+  let curMs =
+    memLiveStartCache?.liveId === liveId && memLiveStartCache?.cacheKey === scope.scopedKey
+      ? memLiveStartCache.ms
+      : null;
   if (curMs == null) {
     const cache = await getStorage(LIVE_START_CACHE_KEY, {});
-    curMs = cache[liveId] ?? null;
+    const fromCache = readScopedLiveStartMsFromCache(cache, liveId);
+    curMs = fromCache.ms;
+    if (curMs != null) {
+      memLiveStartCache = { liveId, cacheKey: fromCache.cacheKey || scope.scopedKey, ms: curMs };
+    }
   }
 
   const jsonMs = detectLiveStartMsFromDocument(liveId);
-  if (jsonMs != null && (curMs == null || Math.abs(jsonMs - curMs) > 25000)) {
+  if (
+    jsonMs != null &&
+    (curMs == null || !isFiniteLiveStartMs(curMs) || Math.abs(jsonMs - curMs) > LIVE_START_CACHE_VALIDATE_DRIFT_MS)
+  ) {
     await cacheLiveStartMs(jsonMs);
     liveUptimeSanitySample = null;
     return;
@@ -3849,18 +3907,35 @@ async function appendEntry(session, type, text, sec, meta = {}) {
 
 async function getLiveStartMs() {
   if (pageInfo.mode !== "live" || !pageInfo.liveId) return null;
-  if (memLiveStartCache?.liveId === pageInfo.liveId) return memLiveStartCache.ms;
-
+  const liveId = pageInfo.liveId;
+  const scope = buildLiveStartCacheScope(liveId);
+  let cached = null;
+  if (memLiveStartCache?.liveId === liveId && memLiveStartCache?.cacheKey === scope.scopedKey) {
+    cached = memLiveStartCache.ms;
+  }
   const cache = await getStorage(LIVE_START_CACHE_KEY, {});
-  if (cache[pageInfo.liveId]) {
-    memLiveStartCache = { liveId: pageInfo.liveId, ms: cache[pageInfo.liveId] };
-    return cache[pageInfo.liveId];
+  if (cached == null) {
+    const fromCache = readScopedLiveStartMsFromCache(cache, liveId);
+    if (fromCache.ms != null) {
+      cached = fromCache.ms;
+      memLiveStartCache = { liveId, cacheKey: fromCache.cacheKey || scope.scopedKey, ms: cached };
+    }
   }
 
-  const fromJson = detectLiveStartMsFromDocument(pageInfo.liveId);
+  const fromJson = detectLiveStartMsFromDocument(liveId);
   if (fromJson) {
-    await cacheLiveStartMs(fromJson);
-    return fromJson;
+    if (!isFiniteLiveStartMs(cached) || Math.abs(fromJson - cached) > LIVE_START_CACHE_VALIDATE_DRIFT_MS) {
+      await cacheLiveStartMs(fromJson);
+      return fromJson;
+    }
+    if (memLiveStartCache?.cacheKey !== scope.scopedKey) {
+      await cacheLiveStartMs(cached);
+    }
+    return cached;
+  }
+
+  if (isFiniteLiveStartMs(cached)) {
+    return cached;
   }
 
   const fromDomElapsed = deriveLiveStartMsFromDomElapsed();
