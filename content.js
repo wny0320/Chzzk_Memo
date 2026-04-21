@@ -224,6 +224,10 @@ function isInsideCmmMarkerUi(el) {
 /**
  * 포인터 타깃이 PZP 진행 바 등에 가려져 `pointerover`가 마커로 안 잡혀도,
  * 좌표가 마커 레이어·클러스터 팝 근처면 "마커 UI 위"로 본다.
+ *
+ * `.cmm-marker::after` 툴팁은 `pointer-events: none`이라 커서가 캡슐 위에 있어도
+ * hit 타깃은 아래 진행 바가 되고, 레이어는 10px 띠라 Y가 툴팁 쪽이면 박스 밖으로 나간다.
+ * 그 경우에도 하단바·마커 홀드를 유지하도록 각 마커의 시각적 툴팁 범위를 기하에 포함한다.
  */
 function isPointerGeometricallyOverCmmTimelineUi(x, y) {
   if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
@@ -245,6 +249,27 @@ function isPointerGeometricallyOverCmmTimelineUi(x, y) {
     if (r.width < 2 && r.height < 2) continue;
     if (x >= r.left - pad && x <= r.right + pad && y >= r.top - pad && y <= r.bottom + pad) return true;
   }
+
+  const tipHalfW = 154;
+  const tipAbove = 102;
+  const tipBelow = 12;
+  try {
+    if (!layer?.querySelectorAll) return false;
+    const dots = layer.querySelectorAll(".cmm-marker");
+    for (const m of dots) {
+      if (!m?.getBoundingClientRect) continue;
+      const r = m.getBoundingClientRect();
+      if (r.width < 0.5 && r.height < 0.5) continue;
+      const cx = (r.left + r.right) / 2;
+      const left = cx - tipHalfW;
+      const right = cx + tipHalfW;
+      const topY = r.top - tipAbove;
+      const botY = r.bottom + tipBelow;
+      if (x >= left && x <= right && y >= topY && y <= botY) return true;
+    }
+  } catch (_) {
+    return false;
+  }
   return false;
 }
 
@@ -253,6 +278,7 @@ function onDocumentPointerOutForMarkerUi(ev) {
   if (!isInsideCmmMarkerUi(ev.target)) return;
   const to = ev.relatedTarget;
   if (isInsideCmmMarkerUi(to)) return;
+  if (isPointerGeometricallyOverCmmTimelineUi(ev.clientX, ev.clientY)) return;
   cmmPointerOverMarkerUi = false;
   lastCmmPzpNudgeMs = 0;
   syncOverlayVisibility();
@@ -271,10 +297,120 @@ function onDocumentPointerOverForMarkerUi(ev) {
 }
 
 function onDocumentPointerMoveForMarkerUi(ev) {
-  if (pageInfo.mode !== "vod" || !cmmPointerOverMarkerUi) return;
-  if (!isInsideCmmMarkerUi(ev.target)) return;
+  if (pageInfo.mode !== "vod") return;
+  if (
+    !cmmPointerOverMarkerUi &&
+    !isVodMarkerClusterPopoverOpen() &&
+    !isPointerGeometricallyOverCmmTimelineUi(ev.clientX, ev.clientY)
+  ) {
+    return;
+  }
   lastMouseX = ev.clientX;
   lastMouseY = ev.clientY;
+}
+
+/**
+ * VOD 진행 슬라이더(및 그 자식)에 합성 mouse/pointer를 쏘면 호버 미리보기 등이 뜸 → nudge 타깃에서 제외.
+ * (플레이어 루트처럼 슬라이더를 ‘포함’만 하는 넓은 노드는 여기서 true로 두지 않음.)
+ */
+function isPzpVodProgressSeekNudgeUnsafe(el, scope) {
+  if (!el || el.nodeType !== 1) return false;
+  const sc = scope && typeof scope.querySelector === "function" ? scope : findPzpPlayerScope() || document;
+  const slider = queryPzpProgressSeekSlider(sc);
+  if (!slider) return false;
+  if (el === slider) return true;
+  try {
+    return Boolean(slider.contains(el));
+  } catch (_) {
+    return false;
+  }
+}
+
+/** 합성 move의 client 좌표를 노드 안으로 맞춤 — 마커 위 좌표로는 PZP가 ‘하단 UI 위’로 인식하지 않는 경우가 있음. */
+function clientPointSnappedInsideEl(el, refX, refY) {
+  if (!el?.getBoundingClientRect) return { x: refX, y: refY };
+  try {
+    const r = el.getBoundingClientRect();
+    if (r.width < 2 || r.height < 2) return { x: refX, y: refY };
+    if (refX >= r.left && refX <= r.right && refY >= r.top && refY <= r.bottom) {
+      return { x: refX, y: refY };
+    }
+    const pad = 3;
+    const cx = Math.min(Math.max(r.left + pad, Math.round(r.left + r.width / 2)), r.right - pad);
+    const cy = Math.min(Math.max(r.top + pad, Math.round(r.top + r.height / 2)), r.bottom - pad);
+    return { x: cx, y: cy };
+  } catch (_) {
+    return { x: refX, y: refY };
+  }
+}
+
+/** 진행 슬라이더가 아닌 하단 크롬 조각(그림자·시간·볼륨 등) — 미리보기 트리거를 피하면서 타이머만 깨우기 위함. */
+function collectPzpSafeChromeNudgeElements(scope) {
+  const sc = scope && typeof scope.querySelector === "function" ? scope : document;
+  const selectors = [
+    ".pzp-pc__bottom-shadow",
+    ".pzp-pc-ui-bottom-shadow",
+    ".pzp-ui-bottom-shadow",
+    ".pzp-pc__vod-time",
+    "[class*='pzp-pc__vod-time']",
+    ".pzp-pc__volume-control",
+    "[class*='pzp-pc__volume-control']"
+  ];
+  const out = [];
+  const add = (el) => {
+    if (!el || el.nodeType !== 1 || !el.isConnected) return;
+    if (isPzpVodProgressSeekNudgeUnsafe(el, scope)) return;
+    if (!out.includes(el)) out.push(el);
+  };
+  for (const sel of selectors) {
+    try {
+      const el = sc.querySelector(sel) || document.querySelector(sel);
+      add(el);
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  return out;
+}
+
+/**
+ * 마커·클러스터 팝은 body 쪽 고정 레이어라 `elementFromPoint` 최상단이 `.pzp-pc`가 아님.
+ * 그 경우 합성 move를 PZP에 안 보내 하단바 타이머가 그대로 돌아가 사라짐 → 스택에서 확장 UI를 건너뛴 뒤 그 아래 타깃을 쓴다.
+ * 진행 슬라이더는 미리보기 트리거가 되므로 스택에서도 건너뛴다.
+ */
+function findPzpHitTargetBelowCmmOverlays(x, y) {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  let stack;
+  try {
+    stack = document.elementsFromPoint(x, y);
+  } catch (_) {
+    return null;
+  }
+  if (!stack?.length) return null;
+  const scope = findPzpPlayerScope();
+  for (const el of stack) {
+    if (!el || el.nodeType !== 1 || typeof el.closest !== "function") continue;
+    if (el.closest("#cmm-marker-layer") || el.closest("#cmm-marker-cluster-pop")) continue;
+    if (
+      el.closest("#cmm-player-tools") ||
+      el.closest("#cmm-editor-panel") ||
+      el.closest("#cmm-bind-panel")
+    ) {
+      continue;
+    }
+    if (el.closest("#cmm-toast")) continue;
+    if (isPzpVodProgressSeekNudgeUnsafe(el, scope)) continue;
+    if (scope && scope.contains(el)) return el;
+    if (
+      el.closest(".pzp-pc") ||
+      el.closest("[class*='pzp-pc']") ||
+      el.closest("[class*='webplayer']") ||
+      el.closest("[class*='pzp-']")
+    ) {
+      return el;
+    }
+  }
+  return null;
 }
 
 /**
@@ -301,60 +437,105 @@ function nudgePzpChromeWhileHoveringMarkers() {
   }
 
   const now = performance.now();
-  if (now - lastCmmPzpNudgeMs < 90) return;
+  const throttleMs = clusterPopOpen || cmmPointerOverMarkerUi ? 38 : 58;
+  if (now - lastCmmPzpNudgeMs < throttleMs) return;
   lastCmmPzpNudgeMs = now;
 
   const x = lastMouseX;
   const y = lastMouseY;
-  const root = findPzpPlayerScope();
+  const scope = findPzpPlayerScope();
   const video = getVideo();
-  const base = {
+
+  const makeBase = (cx, cy) => ({
     bubbles: true,
     cancelable: true,
     composed: true,
     view: window,
-    clientX: x,
-    clientY: y
-  };
+    clientX: cx,
+    clientY: cy
+  });
 
-  const dispatchMouse = (el) => {
+  const dispatchMouseAt = (el, cx, cy) => {
     if (!el) return;
     try {
-      el.dispatchEvent(new MouseEvent("mousemove", base));
+      el.dispatchEvent(new MouseEvent("mousemove", makeBase(cx, cy)));
     } catch (_) {
       /* ignore */
     }
   };
 
+  const seen = new Set();
+  const dispatchMouseOnce = (el, snapCoords) => {
+    if (!el || el.nodeType !== 1 || seen.has(el)) return;
+    if (isPzpVodProgressSeekNudgeUnsafe(el, scope)) return;
+    seen.add(el);
+    const pt = snapCoords ? clientPointSnappedInsideEl(el, x, y) : { x, y };
+    dispatchMouseAt(el, pt.x, pt.y);
+  };
+
+  let under = null;
   try {
-    const top = document.elementFromPoint(x, y);
-    if (top && typeof top.closest === "function" && top.closest(".pzp-pc")) {
-      dispatchMouse(top);
-    }
+    under = findPzpHitTargetBelowCmmOverlays(x, y);
+  } catch (_) {
+    under = null;
+  }
+
+  const bottomAnchor = findPzpBottomChromeAnchor();
+  const bottomRight = findPzpBottomButtonsRight(video);
+  const safeChromeBits = collectPzpSafeChromeNudgeElements(scope);
+
+  try {
+    dispatchMouseAt(window, x, y);
+    dispatchMouseAt(document.documentElement, x, y);
   } catch (_) {
     /* ignore */
   }
-  dispatchMouse(root);
-  dispatchMouse(video);
+
+  dispatchMouseOnce(under, false);
+  for (const bit of safeChromeBits) dispatchMouseOnce(bit, true);
+  dispatchMouseOnce(bottomAnchor, true);
+  dispatchMouseOnce(bottomRight, true);
+  dispatchMouseOnce(scope, false);
+  dispatchMouseOnce(video, false);
 
   if (typeof PointerEvent === "undefined") return;
-  const ptr = {
-    ...base,
-    pointerId: 1,
-    pointerType: "mouse",
-    isPrimary: true,
-    buttons: 0
-  };
-  const dispatchPtr = (el) => {
+
+  const dispatchPtrAt = (el, cx, cy) => {
     if (!el) return;
     try {
-      el.dispatchEvent(new PointerEvent("pointermove", ptr));
+      el.dispatchEvent(
+        new PointerEvent("pointermove", {
+          ...makeBase(cx, cy),
+          pointerId: 1,
+          pointerType: "mouse",
+          isPrimary: true,
+          buttons: 0
+        })
+      );
     } catch (_) {
       /* ignore */
     }
   };
-  dispatchPtr(root);
-  dispatchPtr(video);
+  const seenP = new Set();
+  const dispatchPtrOnce = (el, snapCoords) => {
+    if (!el || el.nodeType !== 1 || seenP.has(el)) return;
+    if (isPzpVodProgressSeekNudgeUnsafe(el, scope)) return;
+    seenP.add(el);
+    const pt = snapCoords ? clientPointSnappedInsideEl(el, x, y) : { x, y };
+    dispatchPtrAt(el, pt.x, pt.y);
+  };
+  try {
+    dispatchPtrAt(window, x, y);
+    dispatchPtrAt(document.documentElement, x, y);
+  } catch (_) {
+    /* ignore */
+  }
+  dispatchPtrOnce(under, false);
+  for (const bit of safeChromeBits) dispatchPtrOnce(bit, true);
+  dispatchPtrOnce(bottomAnchor, true);
+  dispatchPtrOnce(bottomRight, true);
+  dispatchPtrOnce(scope, false);
+  dispatchPtrOnce(video, false);
 }
 
 function installMarkerUiPointerListeners() {
@@ -857,6 +1038,7 @@ async function boot() {
   await loadMemoHotkeyConfig();
   await loadPlayerToolsVisibility();
   await loadCategoryAutoDetect();
+  await cleanupLegacyLiveStartCacheKeys();
   if (isExtensionContextValid()) {
     try {
       chrome.storage.onChanged.addListener(onMemoHotkeyStorageChanged);
@@ -1107,7 +1289,6 @@ const LIVE_SESSION_FUZZY_MS = 2 * 60 * 60 * 1000;
 
 function matchesFuzzyLiveSession(s, liveId, currentLiveStartMs) {
   if (s.source !== "live" || s.sourceId !== liveId) return false;
-  const updatedRecent = Date.now() - (s.updatedAt || 0) < LIVE_SESSION_FUZZY_MS;
   if (
     typeof currentLiveStartMs === "number" &&
     Number.isFinite(currentLiveStartMs) &&
@@ -1117,8 +1298,9 @@ function matchesFuzzyLiveSession(s, liveId, currentLiveStartMs) {
     if (typeof stored === "number" && Number.isFinite(stored) && stored > 0) {
       if (Math.abs(stored - currentLiveStartMs) < LIVE_SESSION_FUZZY_MS) return true;
     }
+    return false;
   }
-  return updatedRecent;
+  return Date.now() - (s.updatedAt || 0) < LIVE_SESSION_FUZZY_MS;
 }
 
 function pickBestFuzzyLiveSession(candidates, currentLiveStartMs) {
@@ -1200,6 +1382,38 @@ function shouldIgnoreMemoHotkeyDueToFocus() {
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
   if (ae.isContentEditable) return true;
   return false;
+}
+
+function isEditableInputLike(el) {
+  if (!el || !(el instanceof HTMLElement)) return false;
+  const tag = el.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") return true;
+  return Boolean(el.isContentEditable);
+}
+
+function isLikelyChzzkChatInput(el) {
+  if (!isEditableInputLike(el)) return false;
+  const container = el.closest(
+    [
+      "[class*='chat']",
+      "[class*='Chat']",
+      "[class*='comment']",
+      "[class*='Comment']",
+      "[id*='chat']",
+      "[id*='comment']",
+      "[data-testid*='chat']",
+      "[data-testid*='comment']"
+    ].join(", ")
+  );
+  return Boolean(container);
+}
+
+function blurChatInputFocusOnEscape(e) {
+  if (e.key !== "Escape") return false;
+  const ae = document.activeElement;
+  if (!isLikelyChzzkChatInput(ae)) return false;
+  ae.blur();
+  return true;
 }
 
 function formatHotkeyForTip(cfg) {
@@ -1336,6 +1550,7 @@ function applyMemoButtonLabels() {
 }
 
 function onGlobalKeydown(e) {
+  if (blurChatInputFocusOnEscape(e)) return;
   if (!memoHotkeyConfig || !matchesMemoHotkey(e, memoHotkeyConfig)) return;
   if (shouldIgnoreMemoHotkeyDueToFocus()) return;
   if (document.visibilityState !== "visible") return;
@@ -2208,9 +2423,29 @@ function readScopedLiveStartMsFromCache(cache, liveId = pageInfo.liveId) {
   if (!scope.liveId) return { ms: null, cacheKey: null };
   const scoped = readLiveStartMsFromCacheEntry(cache?.[scope.scopedKey]);
   if (scoped != null) return { ms: scoped, cacheKey: scope.scopedKey };
-  const legacy = readLiveStartMsFromCacheEntry(cache?.[scope.liveId]);
-  if (legacy != null) return { ms: legacy, cacheKey: scope.liveId };
   return { ms: null, cacheKey: null };
+}
+
+/** 구버전 `liveId` 단일 키 캐시를 제거해 이전 방송 시작시각 재사용을 방지 */
+async function cleanupLegacyLiveStartCacheKeys() {
+  const cache = await getStorage(LIVE_START_CACHE_KEY, {});
+  if (!cache || typeof cache !== "object") return;
+  let changed = false;
+  for (const k of Object.keys(cache)) {
+    if (k.startsWith(LIVE_START_CACHE_PREFIX)) continue;
+    const entry = cache[k];
+    const looksLegacy =
+      isFiniteLiveStartMs(entry) ||
+      (entry &&
+        typeof entry === "object" &&
+        isFiniteLiveStartMs(entry.ms) &&
+        !String(entry.episodeKey || "").trim());
+    if (looksLegacy) {
+      delete cache[k];
+      changed = true;
+    }
+  }
+  if (changed) await setStorage(LIVE_START_CACHE_KEY, cache);
 }
 
 async function cacheLiveStartMs(ms) {
@@ -2224,8 +2459,6 @@ async function cacheLiveStartMs(ms) {
     episodeKey: scope.episodeKey,
     updatedAt: Date.now()
   };
-  // 구버전( liveId 단일 키 ) 데이터와의 호환을 위해 최신값도 유지
-  cache[scope.liveId] = ms;
   await setStorage(LIVE_START_CACHE_KEY, cache);
 }
 
@@ -2401,6 +2634,19 @@ async function getTimelineSecond() {
   let wall = null;
   if (Number.isFinite(startMs) && startMs > 0) {
     wall = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+  }
+  /**
+   * 라이브 URL의 id는 방송 단위가 아닌 채널 단위라, 이전 방송 캐시가 남아 있으면
+   * wall 값이 하루 단위(예: 23시간)로 크게 튈 수 있다.
+   * DOM/PZP 경과가 충분히 작고 wall만 과도하게 큰 경우 캐시를 무효화하고 DOM 값을 우선.
+   */
+  if (Number.isFinite(domPzpMax) && Number.isFinite(wall)) {
+    const largeMismatch = wall - domPzpMax >= 4 * 3600;
+    const domLooksFresh = domPzpMax <= 2 * 3600;
+    if (largeMismatch && domLooksFresh) {
+      void invalidateLiveStartCacheForCurrentLive().catch(handleExtensionAsyncError);
+      return domPzpMax;
+    }
   }
   /* JSON 기반 wall과 DOM/PZP가 잠깐 어긋날 때(레이아웃 전환 직후 등) 가장 진행된 시각을 쓴다. */
   const parts = [domPzpMax, wall].filter((v) => Number.isFinite(v) && v >= 0);
@@ -2741,10 +2987,15 @@ async function removeSessionIdsAndInsertMerged(oldIds, mergedSession) {
 }
 
 function normalizeMemoTitleForMatch(raw) {
-  return String(raw || "")
+  let t = String(raw || "")
     .replace(/\s+-\s+CHZZK.*/i, "")
-    .trim()
-    .normalize("NFKC")
+    .trim();
+  try {
+    t = t.normalize("NFKC");
+  } catch {
+    /* 잘못된 UTF-16(고립 서로게이트 등)이면 RangeError — 라이브 캐시 키·세션 매칭 전체가 멈추지 않게 원문 유지 */
+  }
+  return t
     .replace(/\u2026|…/g, "")
     .replace(/\.{2,}$/g, "")
     .toLowerCase()
@@ -2767,8 +3018,13 @@ function pageVodEpisodeMatchKey() {
 }
 
 function normalizeStreamerComparable(raw) {
-  return String(raw || "")
-    .normalize("NFKC")
+  let t = String(raw || "");
+  try {
+    t = t.normalize("NFKC");
+  } catch {
+    /* normalizeMemoTitleForMatch와 동일: 비정상 UTF-16 시 비교만 완화 */
+  }
+  return t
     .toLowerCase()
     .replace(/\s+/g, "")
     .replace(/[^\p{L}\p{N}]/gu, "");
@@ -2864,7 +3120,6 @@ async function ensureCurrentSession() {
     const liveId = pageInfo.liveId;
     const liveStartMs = await getLiveStartMs();
     const canonicalId = buildLiveSessionStorageId(liveId, liveStartMs);
-    const legacyId = `live:${liveId}`;
     let sessions = await getSessions();
 
     const exact = sessions.find((s) => s.sessionId === canonicalId);
@@ -2874,9 +3129,12 @@ async function ensureCurrentSession() {
     if (fuzzy.length) return pickBestFuzzyLiveSession(fuzzy, liveStartMs);
 
     const msOk = typeof liveStartMs === "number" && Number.isFinite(liveStartMs) && liveStartMs > 0;
-    const legacy = sessions.find((s) => s.sessionId === legacyId);
-    if (!msOk && legacy) {
-      return legacy;
+    if (!msOk) {
+      const recent = sessions
+        .filter((s) => s.source === "live" && s.sourceId === liveId)
+        .slice()
+        .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0];
+      if (recent) return recent;
     }
 
     const created = {
@@ -4029,6 +4287,8 @@ function syncOverlayVisibility() {
   const markers = document.getElementById("cmm-marker-layer");
   const toolsInBar = Boolean(tools?.classList.contains("cmm-in-controls"));
   const markerWasVisible = Boolean(markers && !markers.classList.contains("cmm-hidden"));
+  const markerUiGeometryHold =
+    pageInfo.mode === "vod" && isPointerGeometricallyOverCmmTimelineUi(lastMouseX, lastMouseY);
 
   /*
    * 도구: PZP `.pzp-pc__bottom-buttons-right` 안이면 네이티브 opacity에 맡기고 cmm-hidden을 쓰지 않음.
@@ -4055,11 +4315,11 @@ function syncOverlayVisibility() {
        * 확장 마커 레이어만: 마커·목록 위에 포인터가 있으면 페이드아웃하지 않고, 벗어난 뒤 compound에 따름.
        */
       const holdMarkersForHover =
-        pageInfo.mode === "vod" && (cmmPointerOverMarkerUi || isVodMarkerClusterPopoverOpen());
+        cmmPointerOverMarkerUi || isVodMarkerClusterPopoverOpen() || markerUiGeometryHold;
       showMarkers = holdMarkersForHover || chromeShown;
     } else {
       const holdMarkersForHover =
-        pageInfo.mode === "vod" && (cmmPointerOverMarkerUi || isVodMarkerClusterPopoverOpen());
+        cmmPointerOverMarkerUi || isVodMarkerClusterPopoverOpen() || markerUiGeometryHold;
       showMarkers = holdMarkersForHover || host?.dataset.cmmUiVisible === "1";
     }
     markers.classList.toggle("cmm-hidden", !showMarkers);
@@ -4068,9 +4328,7 @@ function syncOverlayVisibility() {
   if (
     pageInfo.mode === "vod" &&
     toolsInBar &&
-    (cmmPointerOverMarkerUi ||
-      isVodMarkerClusterPopoverOpen() ||
-      isPointerGeometricallyOverCmmTimelineUi(lastMouseX, lastMouseY))
+    (cmmPointerOverMarkerUi || isVodMarkerClusterPopoverOpen() || markerUiGeometryHold)
   ) {
     nudgePzpChromeWhileHoveringMarkers();
   }

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "CHZZK Live Memo Marker",
   "description": "치지직 라이브/VOD에서 메모·카테고리·방제(방송 제목)를 기록하고 타임라인 마커로 다시 이동합니다.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",

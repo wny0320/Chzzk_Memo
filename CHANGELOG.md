@@ -4,7 +4,16 @@
 
 ## [Unreleased]
 
-(아직 배포되지 않은 변경)
+## [0.1.5] - 2026-04-21
+
+### Fixed
+
+- **채팅 입력 포커스 해제(`content.js`)**: 치지직 채팅/댓글 입력창에 포커스된 상태에서 `Esc`를 누르면 입력 포커스를 해제(`blur`)해, 곧바로 메모 단축키를 눌러 메모 입력창을 열 수 있게 했습니다.
+- **VOD 마커 호버·하단바 홀드(`content.js`)**: 마커 툴팁이 `pointer-events: none`이고 마커 레이어가 얇아 실제 타깃이 진행 바로 잡히는 경우 `cmmPointerOverMarkerUi`가 꺼지던 문제를, 마커·툴팁 구역 기하 검사·`pointerout` 시 좌표 재검사·`syncOverlayVisibility`의 `markerUiGeometryHold`로 보완했습니다.
+- **VOD 마커 위에서 PZP 하단 크롬 유지(nudge, `content.js`)**: `elementFromPoint`가 마커만 가리키던 문제는 `elementsFromPoint` 스택에서 확장 UI를 건너 뛴 뒤 PZP 노드를 고르게 했고, 진행 슬라이더 서브트리(`isPzpVodProgressSeekNudgeUnsafe`)에는 합성 이벤트를 보내지 않아 호버 미리보기가 뜨지 않게 했습니다. 슬라이더를 제외한 뒤 타이머가 잘 안 깨지는 경우를 위해 하단 그림자·VOD 시간·볼륨 등 안전한 크롬 조각에 `clientPointSnappedInsideEl`로 좌표를 스냅해 디스패치합니다.
+- **라이브 첫 기록 시각이 `23시간`으로 튀는 현상(`content.js`)**: `getTimelineSecond()`에서 JSON/캐시 기반 wall 경과와 DOM/PZP 경과가 크게 벌어지는 비정상 패턴(예: wall이 수시간 이상 크고 DOM은 방송 초반)일 때, 현재 라이브 시작시각 캐시를 즉시 무효화하고 DOM/PZP 경과를 우선 사용하도록 보강했습니다. 이로써 새 방송 시작 직후 이전 방송 캐시가 섞여 첫 메모 시간이 하루 단위로 크게 표시되는 문제를 줄였습니다.
+- **라이브 시작시각 레거시 캐시 정리(`content.js`)**: `liveId` 단일 키(구버전 호환용) 읽기/쓰기를 중단하고, 확장 부팅 시 해당 레거시 키를 자동 정리하도록 `cleanupLegacyLiveStartCacheKeys()`를 추가했습니다. 이제 `live:${liveId}:${episodeKey}` 스코프 캐시만 사용해, 방송 갱신 후 전날 시작시각이 재사용되는 문제를 줄였습니다.
+- **라이브 세션 엄격 매칭(`content.js`, `popup.js`)**: `liveStartMs`를 읽은 경우에는 시작시각 근접(2시간 퍼지) 세션만 같은 방송 후보로 인정하고, 최근 갱신(`updatedAt`)만으로 다른 방송 세션에 합쳐지는 경로를 제거했습니다. `liveStartMs`를 읽지 못한 경우에는 같은 `liveId`의 최신 세션을 사용하도록 정리했으며, 팝업의 라이브 세션 자동 선택 로직도 동일 기준으로 맞췄습니다.
 
 ## [0.1.4] - 2026-04-13
 

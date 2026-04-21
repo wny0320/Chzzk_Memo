@@ -831,6 +831,7 @@ function findLiveSessionMatchingPageContext(sessionList, ctx) {
       if (typeof st === "number" && Number.isFinite(st) && st > 0) {
         if (Math.abs(st - ms) < LIVE_CTX_FUZZY_MS) return true;
       }
+      return false;
     }
     return Date.now() - (s.updatedAt || 0) < LIVE_CTX_FUZZY_MS;
   });
@@ -1316,9 +1317,6 @@ async function applyActivePageContextSelection(ctx) {
     if (typeof ms === "number" && Number.isFinite(ms)) {
       target =
         sessions.find((s) => s.sessionId === `live:${ctx.liveId}:${Math.floor(ms)}`) || null;
-    }
-    if (!target) {
-      target = sessions.find((s) => s.sessionId === `live:${ctx.liveId}`) || null;
     }
     if (!target) {
       target = findLiveSessionMatchingPageContext(sessions, ctx);
