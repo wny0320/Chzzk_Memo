@@ -42,6 +42,29 @@
           <input type="checkbox" id="category-auto-detect" checked />
           <span>카테고리·방제 자동 감지 사용</span>
         </label>
+        <div id="category-auto-detect-subopts" class="category-auto-detect-subopts" hidden>
+          <label class="cmm-checkbox-setting cmm-checkbox-setting--nested">
+            <input type="checkbox" id="category-auto-detect-allowlist-only" />
+            <span>목록에 등록한 스트리머 방송만 자동 감지</span>
+          </label>
+          <details class="cmm-collapsible-disclosure cmm-allowlist-disclosure" id="category-auto-detect-allowlist-disclosure">
+            <summary class="cmm-collapsible-summary">자동 감지 채널 목록</summary>
+            <div class="cmm-collapsible-body cmm-allowlist-disclosure-body">
+              <p class="hint small" id="category-auto-detect-allowlist-hint">
+                치지직 <strong>라이브</strong> 페이지를 연 뒤 「현재 채널 추가」를 누르세요.
+              </p>
+              <div class="cmm-allowlist-actions">
+                <button type="button" id="category-auto-detect-add-btn" class="btn-secondary cmm-allowlist-add-btn">
+                  현재 채널 추가
+                </button>
+              </div>
+              <div id="category-auto-detect-allowlist-list" class="cmm-allowlist-list" role="list"></div>
+              <p class="entry-list-empty" id="category-auto-detect-allowlist-empty" hidden>
+                등록된 채널이 없습니다. 라이브 시청 중 「현재 채널 추가」를 눌러 주세요.
+              </p>
+            </div>
+          </details>
+        </div>
       </section>
 
       <label class="field-label" for="streamer-select">스트리머</label>
@@ -49,7 +72,8 @@
         <select id="streamer-select"></select>
       </div>
 
-      <label class="field-label" for="session-select">세션 (방송 제목만 표시)</label>
+      <label class="field-label" for="session-select">세션 (방송 날짜 · 제목)</label>
+      <p class="hint small session-broadcast-date" id="session-broadcast-date" hidden></p>
       <div class="session-block">
         <div class="select-wrap">
           <select id="session-select"></select>
@@ -67,6 +91,29 @@
         <label><input type="checkbox" id="sort-asc" checked /> 빠른순</label>
       </div>
       <div id="entry-list" class="entry-list"></div>
+
+      <details class="cmm-collapsible-disclosure cmm-export-format-disclosure cmm-dock-hide" id="export-format-disclosure">
+        <summary class="cmm-collapsible-summary">복사·보내기 양식</summary>
+        <div class="cmm-collapsible-body cmm-export-format-body">
+          <p class="hint small">Copy·TXT Export에 포함할 항목입니다. 메모 줄은 항상 시각이 붙습니다.</p>
+          <label class="cmm-checkbox-setting cmm-export-format-opt">
+            <input type="checkbox" id="export-opt-streamer" checked />
+            <span>스트리머</span>
+          </label>
+          <label class="cmm-checkbox-setting cmm-export-format-opt">
+            <input type="checkbox" id="export-opt-title" checked />
+            <span>방송 제목 (VOD 제목)</span>
+          </label>
+          <label class="cmm-checkbox-setting cmm-export-format-opt">
+            <input type="checkbox" id="export-opt-date" checked />
+            <span>날짜</span>
+          </label>
+          <label class="cmm-checkbox-setting cmm-export-format-opt">
+            <input type="checkbox" id="export-opt-category-times" checked />
+            <span>카테고리·방제 변경 시각</span>
+          </label>
+        </div>
+      </details>
 
       <div class="actions cmm-dock-hide">
         <button id="copy-btn">Copy</button>

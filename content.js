@@ -1,5 +1,7 @@
 ﻿const STORAGE_KEY = "chzzkMemoSessions";
 const VOD_BINDING_KEY = "chzzkVodBindings";
+/** VOD 페이지에서 읽은 방송(라이브 시작) 날짜 캐시 — `vodId` → `{ broadcastDate, updatedAt }` */
+const VOD_BROADCAST_DATE_CACHE_KEY = "chzzkVodBroadcastDateCache";
 /** 팝업이 현재 탭의 VOD/라이브와 동일한 세션을 고르기 위한 힌트 (storage) */
 const ACTIVE_PAGE_CONTEXT_KEY = "chzzkActivePageContext";
 const CATEGORY_STATE_KEY = "chzzkCategoryState";
@@ -11,6 +13,9 @@ const MEMO_HOTKEY_KEY = "chzzkMemoHotkey";
 const PLAYER_TOOLS_VISIBILITY_KEY = "chzzkPlayerToolsVisibility";
 /** 라이브 카테고리 / 방송 제목(방제) 자동 감지·자동 기록 (기본 ON) */
 const CATEGORY_AUTO_DETECT_KEY = "chzzkCategoryAutoDetect";
+/** `all` | `allowlist` — allowlist일 때 아래 목록의 스트리머 방송만 자동 감지 */
+const CATEGORY_AUTO_DETECT_SCOPE_KEY = "chzzkCategoryAutoDetectScope";
+const CATEGORY_AUTO_DETECT_ALLOWLIST_KEY = "chzzkCategoryAutoDetectAllowlist";
 
 /** 치지직 플레이어 기본 조작과 겹치는 키 — 단축키로 지정 불가 (Cheese-PIP 도킹 대상 `.pzp-pc` 영역과 동일하게 플레이어·하단바에서만 단축키 처리). */
 const CHZZK_MEMO_RESERVED_CODES = new Set([
@@ -74,6 +79,10 @@ let memoHotkeyConfig = { ...DEFAULT_MEMO_HOTKEY };
 let playerToolsVisibility = { showMemo: true, showBind: true };
 /** @type {boolean} */
 let categoryAutoDetectEnabled = true;
+/** @type {"all"|"allowlist"} */
+let categoryAutoDetectScope = "all";
+/** @type {string[]} */
+let categoryAutoDetectAllowlist = [];
 
 let pageInfo = getPageInfo();
 let lastHref = location.href;
@@ -91,6 +100,8 @@ let liveStartPeriodicTimer = null;
 let liveUptimeSanitySample = null;
 /** `getLiveStartMs` storage 전 동일 라이브+방송키에 대한 메모리 캐시 */
 let memLiveStartCache = null;
+/** `{ vodId: string, broadcastDate: string }` */
+let memVodBroadcastDateCache = null;
 let lastMouseX = 0;
 let lastMouseY = 0;
 let toolsRelocateTimer = null;
@@ -184,6 +195,7 @@ function tearDownAfterInvalidExtensionContext() {
     chrome.storage.onChanged.removeListener(onVodBindingStorageChanged);
     chrome.storage.onChanged.removeListener(onPlayerToolsVisibilityStorageChanged);
     chrome.storage.onChanged.removeListener(onCategoryAutoDetectStorageChanged);
+    chrome.storage.onChanged.removeListener(onCategoryAutoDetectScopeStorageChanged);
   } catch (_) {
     /* ignore */
   }
@@ -1000,11 +1012,12 @@ async function importCommentRowToVodSession(row) {
     toast("타임라인(H:MM:SS 또는 M:SS 등)을 찾을 수 없습니다.");
     return;
   }
-  const session = await getConsolidatedVodSession();
+  let session = await getConsolidatedVodSession();
   if (!session) {
     toast("세션을 불러올 수 없습니다.");
     return;
   }
+  session = await ensureVodSessionBroadcastDate(session);
   let added = 0;
   let skippedDup = 0;
   for (let i = 0; i < matches.length; i++) {
@@ -1038,6 +1051,7 @@ async function boot() {
   await loadMemoHotkeyConfig();
   await loadPlayerToolsVisibility();
   await loadCategoryAutoDetect();
+  await loadCategoryAutoDetectScope();
   await cleanupLegacyLiveStartCacheKeys();
   if (isExtensionContextValid()) {
     try {
@@ -1046,6 +1060,7 @@ async function boot() {
       chrome.storage.onChanged.addListener(onVodBindingStorageChanged);
       chrome.storage.onChanged.addListener(onPlayerToolsVisibilityStorageChanged);
       chrome.storage.onChanged.addListener(onCategoryAutoDetectStorageChanged);
+      chrome.storage.onChanged.addListener(onCategoryAutoDetectScopeStorageChanged);
     } catch (_) {
       /* ignore */
     }
@@ -1065,6 +1080,7 @@ async function boot() {
     await tryAutoBindVod();
     startVodMarkerLoop();
     startCommentImportFeature();
+    void probeVodBroadcastDateSoon();
   }
 
   await publishActivePageContext();
@@ -1165,6 +1181,7 @@ async function onLocationChange() {
     return;
   }
   const previousLiveId = pageInfo.liveId;
+  const previousVodId = pageInfo.vodId;
   lastHref = href;
   pageInfo = fresh;
   if (!pageInfo.isChzzk) return;
@@ -1172,6 +1189,9 @@ async function onLocationChange() {
   if (pageInfo.mode !== "live" || pageInfo.liveId !== previousLiveId) {
     memLiveStartCache = null;
     liveUptimeSanitySample = null;
+  }
+  if (pageInfo.mode !== "vod" || pageInfo.vodId !== previousVodId) {
+    memVodBroadcastDateCache = null;
   }
 
   document.getElementById("cmm-editor-panel")?.classList.remove("show");
@@ -1203,6 +1223,7 @@ async function onLocationChange() {
     await tryAutoBindVod();
     startVodMarkerLoop();
     startCommentImportFeature();
+    void probeVodBroadcastDateSoon();
   }
   syncOverlayVisibility();
   await publishActivePageContext();
@@ -1517,6 +1538,263 @@ function normalizeCategoryAutoDetect(raw) {
   return raw !== false;
 }
 
+function normalizeCategoryAutoDetectScope(raw) {
+  return raw === "allowlist" ? "allowlist" : "all";
+}
+
+function normalizeCategoryAutoDetectAllowlist(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    let ent = null;
+    if (typeof item === "string") {
+      const streamerName = item.trim();
+      if (!streamerName || streamerName.length > 40) continue;
+      ent = {
+        id: crypto.randomUUID(),
+        liveId: null,
+        streamerName,
+        addedAt: Date.now()
+      };
+    } else if (item && typeof item === "object") {
+      const streamerName = String(item.streamerName || "").trim();
+      const liveId = String(item.liveId || "").trim() || null;
+      if (!streamerName && !liveId) continue;
+      ent = {
+        id: String(item.id || crypto.randomUUID()),
+        liveId,
+        streamerName: (streamerName || liveId || "").slice(0, 40),
+        addedAt: Number(item.addedAt) || Date.now()
+      };
+    }
+    if (!ent) continue;
+    const dedupeKey = ent.liveId
+      ? `live:${ent.liveId}`
+      : `name:${normalizeStreamerAllowKey(ent.streamerName)}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push(ent);
+  }
+  return out.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+}
+
+function normalizeStreamerAllowKey(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "");
+}
+
+function msToBroadcastDateString(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  const d = new Date(ms);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function deriveBroadcastDateForSession(session) {
+  if (session?.broadcastDate && /^\d{4}-\d{2}-\d{2}$/.test(session.broadcastDate)) {
+    return session.broadcastDate;
+  }
+  if (Number.isFinite(session?.liveStartMs) && session.liveStartMs > 0) {
+    return msToBroadcastDateString(session.liveStartMs);
+  }
+  if (Number.isFinite(session?.createdAt) && session.createdAt > 0) {
+    return msToBroadcastDateString(session.createdAt);
+  }
+  return msToBroadcastDateString(Date.now());
+}
+
+function readVodVideoInformationTextBlob() {
+  const parts = [];
+  const add = (raw) => {
+    const s = String(raw || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (s) parts.push(s);
+  };
+  const selectors = [
+    "[class*='video_information_label']",
+    "[class*='video_information_data']",
+    "[class*='video_information_type_vod']",
+    "[class*='video_information_count']"
+  ];
+  for (const sel of selectors) {
+    try {
+      document.querySelectorAll(sel).forEach((el) => {
+        add(el.textContent);
+        add(el.innerText);
+        add(el.getAttribute?.("title"));
+        add(el.getAttribute?.("aria-label"));
+      });
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  return parts.join("\n");
+}
+
+/** VOD 상단 정보(조회수·등록일 줄)에 마우스를 올려야 툴팁/라벨이 채워지는 레이아웃 대비 */
+function nudgeVodVideoInformationHover() {
+  const triggers = document.querySelectorAll(
+    [
+      "[class*='video_information_type_vod']",
+      "[class*='video_information_data']",
+      "span[class*='video_information_count']",
+      "[class*='video_information_count']"
+    ].join(", ")
+  );
+  for (const el of triggers) {
+    if (!el?.dispatchEvent) continue;
+    try {
+      const base = { bubbles: true, cancelable: true, composed: true, view: window };
+      el.dispatchEvent(new MouseEvent("mouseover", base));
+      el.dispatchEvent(new MouseEvent("mouseenter", base));
+      el.dispatchEvent(new PointerEvent("pointerover", { ...base, pointerId: 1, pointerType: "mouse" }));
+    } catch (_) {
+      /* ignore */
+    }
+  }
+}
+
+function parseVodMdPairFromText(blob, labelRe) {
+  const m = String(blob || "").match(labelRe);
+  if (!m) return null;
+  const month = Number(m[1]);
+  const day = Number(m[2]);
+  if (!Number.isFinite(month) || !Number.isFinite(day) || month < 1 || month > 12 || day < 1 || day > 31) {
+    return null;
+  }
+  return { month, day };
+}
+
+function inferYearForVodMd(month, day, registered = null) {
+  const now = new Date();
+  let year = now.getFullYear();
+  const liveAt = (y) => new Date(y, month - 1, day);
+  let live = liveAt(year);
+  if (registered && Number.isFinite(registered.month) && Number.isFinite(registered.day)) {
+    const reg = new Date(year, registered.month - 1, registered.day);
+    if (live.getTime() > reg.getTime()) year -= 1;
+    live = liveAt(year);
+  } else {
+    if (live.getTime() > now.getTime() + 2 * 86400000) year -= 1;
+    if (now.getTime() - live.getTime() > 370 * 86400000) year += 1;
+  }
+  return year;
+}
+
+function detectVodLiveStartBroadcastDateFromDom() {
+  let blob = readVodVideoInformationTextBlob();
+  let liveStart = parseVodMdPairFromText(blob, /라이브\s*시작일\s*[:：]\s*(\d{1,2})\.(\d{1,2})/i);
+  let registered = parseVodMdPairFromText(blob, /등록일\s*[:：]\s*(\d{1,2})\.(\d{1,2})/i);
+  if (!liveStart) {
+    nudgeVodVideoInformationHover();
+    blob = readVodVideoInformationTextBlob();
+    liveStart = parseVodMdPairFromText(blob, /라이브\s*시작일\s*[:：]\s*(\d{1,2})\.(\d{1,2})/i);
+    registered = parseVodMdPairFromText(blob, /등록일\s*[:：]\s*(\d{1,2})\.(\d{1,2})/i);
+  }
+  if (!liveStart) return null;
+  const year = inferYearForVodMd(liveStart.month, liveStart.day, registered);
+  const m = String(liveStart.month).padStart(2, "0");
+  const d = String(liveStart.day).padStart(2, "0");
+  return `${year}-${m}-${d}`;
+}
+
+async function resolveVodBroadcastDate(options = {}) {
+  const forceRescan = Boolean(options.forceRescan);
+  if (pageInfo.mode !== "vod" || !pageInfo.vodId) return null;
+  const vodId = pageInfo.vodId;
+  if (
+    !forceRescan &&
+    memVodBroadcastDateCache?.vodId === vodId &&
+    memVodBroadcastDateCache?.broadcastDate
+  ) {
+    return memVodBroadcastDateCache.broadcastDate;
+  }
+  if (!forceRescan) {
+    try {
+      const cache = await getStorage(VOD_BROADCAST_DATE_CACHE_KEY, {});
+      const hit = cache?.[vodId]?.broadcastDate;
+      if (hit && /^\d{4}-\d{2}-\d{2}$/.test(hit)) {
+        memVodBroadcastDateCache = { vodId, broadcastDate: hit };
+        return hit;
+      }
+    } catch (e) {
+      handleExtensionAsyncError(e);
+    }
+  }
+  const detected = detectVodLiveStartBroadcastDateFromDom();
+  if (!detected) return null;
+  memVodBroadcastDateCache = { vodId, broadcastDate: detected };
+  try {
+    const cache = await getStorage(VOD_BROADCAST_DATE_CACHE_KEY, {});
+    cache[vodId] = { broadcastDate: detected, updatedAt: Date.now() };
+    await setStorage(VOD_BROADCAST_DATE_CACHE_KEY, cache);
+  } catch (e) {
+    handleExtensionAsyncError(e);
+  }
+  return detected;
+}
+
+async function persistSessionBroadcastDate(sessionId, broadcastDate) {
+  if (!sessionId || !broadcastDate) return;
+  await runSessionStorageLocked(async () => {
+    let sessions = dedupeSessionsBySessionId(await getSessions());
+    const idx = sessions.findIndex((s) => s.sessionId === sessionId);
+    if (idx < 0) return;
+    sessions[idx] = { ...sessions[idx], broadcastDate, updatedAt: Date.now() };
+    await setStorage(STORAGE_KEY, sessions);
+  });
+}
+
+async function ensureVodSessionBroadcastDate(session) {
+  if (!session?.sessionId || pageInfo.mode !== "vod") return session;
+  if (Number.isFinite(session.liveStartMs) && session.liveStartMs > 0) {
+    const fromLive = msToBroadcastDateString(session.liveStartMs);
+    if (fromLive && session.broadcastDate === fromLive) return session;
+  }
+  const fromPage = await resolveVodBroadcastDate();
+  if (!fromPage) return session;
+  if (session.broadcastDate === fromPage) return session;
+  await persistSessionBroadcastDate(session.sessionId, fromPage);
+  return { ...session, broadcastDate: fromPage };
+}
+
+async function probeVodBroadcastDateSoon() {
+  if (pageInfo.mode !== "vod" || !pageInfo.vodId) return;
+  for (const waitMs of [0, 500, 1200, 2800]) {
+    if (pageInfo.mode !== "vod" || !pageInfo.vodId) return;
+    if (waitMs) await delay(waitMs);
+    const bd = await resolveVodBroadcastDate({ forceRescan: waitMs > 0 });
+    if (!bd) continue;
+    try {
+      const session = await getConsolidatedVodSession();
+      if (session) await ensureVodSessionBroadcastDate(session);
+    } catch (e) {
+      handleExtensionAsyncError(e);
+    }
+    return;
+  }
+}
+
+function isCategoryAutoDetectActiveForPage() {
+  if (!categoryAutoDetectEnabled) return false;
+  if (categoryAutoDetectScope !== "allowlist") return true;
+  const currentLiveId = pageInfo.liveId ? String(pageInfo.liveId) : "";
+  const currentName = normalizeStreamerAllowKey(getStreamerName());
+  for (const item of categoryAutoDetectAllowlist) {
+    if (item?.liveId && currentLiveId && item.liveId === currentLiveId) return true;
+    const nameKey = normalizeStreamerAllowKey(item?.streamerName);
+    if (nameKey && currentName && nameKey === currentName) return true;
+  }
+  return false;
+}
+
 async function loadCategoryAutoDetect() {
   if (!isExtensionContextValid()) return;
   try {
@@ -1528,10 +1806,44 @@ async function loadCategoryAutoDetect() {
   }
 }
 
+async function loadCategoryAutoDetectScope() {
+  if (!isExtensionContextValid()) return;
+  try {
+    const scope = await getStorage(CATEGORY_AUTO_DETECT_SCOPE_KEY, "all");
+    const list = await getStorage(CATEGORY_AUTO_DETECT_ALLOWLIST_KEY, []);
+    categoryAutoDetectScope = normalizeCategoryAutoDetectScope(scope);
+    categoryAutoDetectAllowlist = normalizeCategoryAutoDetectAllowlist(list);
+  } catch (e) {
+    handleExtensionAsyncError(e);
+    categoryAutoDetectScope = "all";
+    categoryAutoDetectAllowlist = [];
+  }
+}
+
 function onCategoryAutoDetectStorageChanged(changes, area) {
   if (area !== "local" || !changes[CATEGORY_AUTO_DETECT_KEY]) return;
   categoryAutoDetectEnabled = normalizeCategoryAutoDetect(changes[CATEGORY_AUTO_DETECT_KEY].newValue);
-  if (!categoryAutoDetectEnabled) {
+  if (!isCategoryAutoDetectActiveForPage()) {
+    stopMetadataWatch();
+    return;
+  }
+  if (pageInfo.mode === "live") {
+    void ensureLiveMetadataOnJoin({ skipInitialDelay: true }).catch(handleExtensionAsyncError);
+  }
+}
+
+function onCategoryAutoDetectScopeStorageChanged(changes, area) {
+  if (area !== "local") return;
+  if (changes[CATEGORY_AUTO_DETECT_SCOPE_KEY]) {
+    categoryAutoDetectScope = normalizeCategoryAutoDetectScope(changes[CATEGORY_AUTO_DETECT_SCOPE_KEY].newValue);
+  }
+  if (changes[CATEGORY_AUTO_DETECT_ALLOWLIST_KEY]) {
+    categoryAutoDetectAllowlist = normalizeCategoryAutoDetectAllowlist(
+      changes[CATEGORY_AUTO_DETECT_ALLOWLIST_KEY].newValue
+    );
+  }
+  if (!changes[CATEGORY_AUTO_DETECT_SCOPE_KEY] && !changes[CATEGORY_AUTO_DETECT_ALLOWLIST_KEY]) return;
+  if (!isCategoryAutoDetectActiveForPage()) {
     stopMetadataWatch();
     return;
   }
@@ -2907,6 +3219,7 @@ async function publishActivePageContext() {
     liveId: pi.liveId,
     liveStartMs: liveStartMsPayload,
     pageTitle: title,
+    streamerName: getStreamerName(),
     resolvedSessionId
   };
   const json = JSON.stringify(payload);
@@ -2915,7 +3228,7 @@ async function publishActivePageContext() {
   await setStorage(ACTIVE_PAGE_CONTEXT_KEY, payload);
 }
 
-function buildMergedVodSessionRecord(matches, canonicalId, vodId) {
+async function buildMergedVodSessionRecord(matches, canonicalId, vodId) {
   const entryDedup = new Map();
   for (const m of matches.slice().sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))) {
     for (const e of m.entries || []) {
@@ -2930,12 +3243,21 @@ function buildMergedVodSessionRecord(matches, canonicalId, vodId) {
     return String(a.type).localeCompare(String(b.type));
   });
   const primary = matches.slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0];
+  const liveMs = matches.map((m) => m.liveStartMs).find((v) => Number.isFinite(v) && v > 0);
+  const vodBd = await resolveVodBroadcastDate();
+  const broadcastDate =
+    vodBd ||
+    primary.broadcastDate ||
+    (liveMs ? msToBroadcastDateString(liveMs) : null) ||
+    deriveBroadcastDateForSession(primary);
   return {
     sessionId: canonicalId,
     source: "vod",
     sourceId: vodId,
     streamerName: primary.streamerName || getStreamerName(),
     title: primary.title || document.title.replace(/\s+-\s+CHZZK.*/i, "").trim(),
+    broadcastDate,
+    liveStartMs: liveMs || primary.liveStartMs || null,
     createdAt: Math.min(...matches.map((m) => m.createdAt || Date.now())),
     updatedAt: Date.now(),
     entries
@@ -3078,12 +3400,14 @@ async function getConsolidatedVodSession() {
   }
 
   if (matches.length === 0) {
+    const vodBd = (await resolveVodBroadcastDate()) || msToBroadcastDateString(Date.now());
     return {
       sessionId: canonicalId,
       source: "vod",
       sourceId: vodId,
       streamerName: getStreamerName(),
       title: document.title.replace(/\s+-\s+CHZZK.*/i, "").trim(),
+      broadcastDate: vodBd,
       createdAt: Date.now(),
       updatedAt: Date.now(),
       entries: []
@@ -3102,12 +3426,13 @@ async function getConsolidatedVodSession() {
       };
       await swapSessionIdInStorage(s.sessionId, migrated);
       sessions = await getSessions();
-      return sessions.find((x) => x.sessionId === canonicalId) || migrated;
+      const out = sessions.find((x) => x.sessionId === canonicalId) || migrated;
+      return ensureVodSessionBroadcastDate(out);
     }
-    return s;
+    return ensureVodSessionBroadcastDate(s);
   }
 
-  const merged = buildMergedVodSessionRecord(matches, canonicalId, vodId);
+  const merged = await buildMergedVodSessionRecord(matches, canonicalId, vodId);
   await removeSessionIdsAndInsertMerged(
     matches.map((m) => m.sessionId),
     merged
@@ -3137,33 +3462,38 @@ async function ensureCurrentSession() {
       if (recent) return recent;
     }
 
+    const now = Date.now();
     const created = {
       sessionId: canonicalId,
       source: "live",
       sourceId: liveId,
       streamerName: getStreamerName(),
       liveStartMs: msOk ? Math.floor(liveStartMs) : null,
+      broadcastDate: msOk ? msToBroadcastDateString(liveStartMs) : msToBroadcastDateString(now),
       title: document.title.replace(/\s+-\s+CHZZK.*/i, "").trim(),
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
+      createdAt: now,
+      updatedAt: now,
       entries: []
     };
     return created;
   }
 
   if (pageInfo.mode === "vod" && pageInfo.vodId) {
-    return getConsolidatedVodSession();
+    const session = await getConsolidatedVodSession();
+    return session ? ensureVodSessionBroadcastDate(session) : session;
   }
 
   const fallbackId = `manual:${new Date().toISOString().slice(0, 10)}:${Math.random().toString(36).slice(2, 8)}`;
+  const now = Date.now();
   return {
     sessionId: fallbackId,
     source: pageInfo.mode,
     sourceId: pageInfo.vodId || pageInfo.liveId || "unknown",
     streamerName: getStreamerName(),
+    broadcastDate: msToBroadcastDateString(now),
     title: document.title.replace(/\s+-\s+CHZZK.*/i, "").trim(),
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
+    createdAt: now,
+    updatedAt: now,
     entries: []
   };
 }
@@ -3344,7 +3674,7 @@ function clusterEntryLine(entry, sortedSessionEntries) {
   return t || "메모";
 }
 
-function openClusterPopover(anchorEl, items, video, sortedSessionEntries) {
+function openClusterPopover(anchorEl, items, video, sortedSessionEntries, sessionId) {
   if (!anchorEl || !items?.length || !video) return;
   const existing = document.getElementById("cmm-marker-cluster-pop");
   if (existing && clusterPopoverAnchor === anchorEl) {
@@ -3362,13 +3692,16 @@ function openClusterPopover(anchorEl, items, video, sortedSessionEntries) {
 
   const head = document.createElement("div");
   head.className = "cmm-cluster-pop-head";
-  head.textContent = `${items.length}개 · 항목을 눌러 이동 (메모·카테고리)`;
+  head.textContent = `${items.length}개 · 눌러 이동 · 메모는 ×로 삭제`;
   pop.appendChild(head);
 
   const list = document.createElement("div");
   list.className = "cmm-cluster-pop-list";
 
   for (const entry of items) {
+    const wrap = document.createElement("div");
+    wrap.className = "cmm-cluster-pop-item-wrap";
+
     const row = document.createElement("button");
     row.type = "button";
     row.className = "cmm-cluster-pop-item";
@@ -3391,7 +3724,24 @@ function openClusterPopover(anchorEl, items, video, sortedSessionEntries) {
       closeClusterPopover({ releaseMarkerHoverHold: true });
       requestAnimationFrame(() => syncOverlayVisibility());
     });
-    list.appendChild(row);
+    wrap.appendChild(row);
+
+    if (entry.type === "memo" && sessionId) {
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "cmm-cluster-pop-del";
+      delBtn.setAttribute("aria-label", "메모 삭제");
+      delBtn.title = "메모 삭제";
+      delBtn.textContent = "×";
+      delBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        void deleteSessionEntry(sessionId, entry).catch(handleExtensionAsyncError);
+      });
+      wrap.appendChild(delBtn);
+    }
+
+    list.appendChild(wrap);
   }
   pop.appendChild(list);
   getCmmOverlayMountRoot().appendChild(pop);
@@ -3478,6 +3828,7 @@ async function renderVodMarkers() {
     closeClusterPopover({ releaseMarkerHoverHold: true });
     layer.innerHTML = "";
 
+    const sessionId = session.sessionId;
     const entries = (session.entries || []).slice().sort((a, b) => a.sec - b.sec);
     const adaptiveGapSec = getAdaptiveClusterGapSec(duration);
     const maxSpanSec = getMaxClusterSpanSec(duration);
@@ -3512,6 +3863,14 @@ async function renderVodMarkers() {
           video.currentTime = entry.sec;
           video.play().catch(() => {});
         });
+        if (entry.type === "memo" && sessionId) {
+          dot.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            void deleteSessionEntry(sessionId, entry).catch(handleExtensionAsyncError);
+          });
+          dot.title = (dot.dataset.cmmTip || "마커") + " · 우클릭: 메모 삭제";
+        }
       } else {
         dot.className = "cmm-marker cmm-marker--cluster";
         dot.style.left = `${left}%`;
@@ -3524,7 +3883,7 @@ async function renderVodMarkers() {
         dot.addEventListener("click", (e) => {
           e.stopPropagation();
           e.preventDefault();
-          openClusterPopover(dot, group, video, entries);
+          openClusterPopover(dot, group, video, entries, sessionId);
         });
       }
       layer.appendChild(dot);
@@ -3698,8 +4057,37 @@ function toast(message) {
  * @param {{ skipInitialDelay?: boolean }} [options]
  * `skipInitialDelay`: 팝업에서 자동 감지를 다시 켠 직후 등, 긴 대기 없이 한 번 읽기.
  */
+async function deleteSessionEntry(sessionId, entry) {
+  if (!sessionId || !entry) return false;
+  const kind = entry.type === "memo" ? "메모" : "기록";
+  if (!window.confirm(`이 ${kind}를 삭제할까요? 되돌릴 수 없습니다.`)) return false;
+
+  let removed = false;
+  await runSessionStorageLocked(async () => {
+    let sessions = dedupeSessionsBySessionId(await getSessions());
+    const idx = sessions.findIndex((s) => s.sessionId === sessionId);
+    if (idx < 0) return;
+    const match = (en) => {
+      if (entry.id && en.id) return en.id === entry.id;
+      return en.sec === entry.sec && en.type === entry.type && (en.text || "") === (entry.text || "");
+    };
+    const prev = sessions[idx].entries || [];
+    const next = prev.filter((en) => !match(en));
+    if (next.length === prev.length) return;
+    sessions[idx] = { ...sessions[idx], entries: next, updatedAt: Date.now() };
+    await setStorage(STORAGE_KEY, sessions);
+    removed = true;
+  });
+  if (removed) {
+    toast("삭제됨");
+    closeClusterPopover({ releaseMarkerHoverHold: true });
+    safeRenderVodMarkers();
+  }
+  return removed;
+}
+
 async function ensureLiveMetadataOnJoin(options = {}) {
-  if (!categoryAutoDetectEnabled) {
+  if (!isCategoryAutoDetectActiveForPage()) {
     stopMetadataWatch();
     return;
   }
@@ -3708,7 +4096,7 @@ async function ensureLiveMetadataOnJoin(options = {}) {
   if (!options.skipInitialDelay) {
     await delay(1200);
   }
-  if (!categoryAutoDetectEnabled) {
+  if (!isCategoryAutoDetectActiveForPage()) {
     stopMetadataWatch();
     return;
   }
@@ -3719,7 +4107,7 @@ async function ensureLiveMetadataOnJoin(options = {}) {
   let detected = getCurrentCategoryText();
   if (!detected) {
     await delay(1000);
-    if (!categoryAutoDetectEnabled) {
+    if (!isCategoryAutoDetectActiveForPage()) {
       stopMetadataWatch();
       return;
     }
@@ -3736,10 +4124,10 @@ async function ensureLiveMetadataOnJoin(options = {}) {
 }
 
 function startMetadataWatch() {
-  if (!categoryAutoDetectEnabled) return;
+  if (!isCategoryAutoDetectActiveForPage()) return;
   if (metadataWatchTimer) return;
   metadataWatchTimer = window.setInterval(async () => {
-    if (!categoryAutoDetectEnabled) return;
+    if (!isCategoryAutoDetectActiveForPage()) return;
     if (pageInfo.mode !== "live") return;
     if (!getVideo() || isLiveBroadcastEndedState()) {
       stopMetadataWatch();
@@ -4074,7 +4462,7 @@ function getLastRecordedCategoryFromEntries(entries) {
  * @param {{ sessionId: string }} session
  */
 async function checkAndInsertMetadataIfChanged(session, currentCategory, currentTitle, sec) {
-  if (!categoryAutoDetectEnabled) return;
+  if (!isCategoryAutoDetectActiveForPage()) return;
   const sessions = await getSessions();
   const latestSession = sessions.find((s) => s.sessionId === session.sessionId) || session;
   const catTrim = String(currentCategory || "").trim();
@@ -4129,6 +4517,10 @@ async function appendEntry(session, type, text, sec, meta = {}) {
   const sessionId = session.sessionId;
   const secN = Math.max(0, Math.floor(sec));
   const textN = (text || "").trim();
+  let vodBroadcastDate = null;
+  if (pageInfo.mode === "vod" && pageInfo.vodId) {
+    vodBroadcastDate = await resolveVodBroadcastDate();
+  }
   let inserted = false;
   await runSessionStorageLocked(async () => {
     let sessions = dedupeSessionsBySessionId(await getSessions());
@@ -4153,7 +4545,13 @@ async function appendEntry(session, type, text, sec, meta = {}) {
       ...(meta.autoMeta === "title" || meta.autoMeta === "both" ? { autoMeta: meta.autoMeta } : {})
     };
     const entries = [...(base.entries || []), newEntry];
-    const merged = { ...base, entries, updatedAt: Date.now() };
+    const broadcastDate = vodBroadcastDate || deriveBroadcastDateForSession(base);
+    const merged = {
+      ...base,
+      entries,
+      updatedAt: Date.now(),
+      broadcastDate
+    };
     if (idx >= 0) sessions[idx] = merged;
     else sessions.push(merged);
     sessions = dedupeSessionsBySessionId(sessions);

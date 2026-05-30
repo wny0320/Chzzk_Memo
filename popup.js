@@ -5,7 +5,16 @@ const MEMO_HOTKEY_KEY = "chzzkMemoHotkey";
 const PLAYER_TOOLS_VISIBILITY_KEY = "chzzkPlayerToolsVisibility";
 const DEFAULT_PLAYER_TOOLS_VISIBILITY = { showMemo: true, showBind: true };
 const CATEGORY_AUTO_DETECT_KEY = "chzzkCategoryAutoDetect";
+const CATEGORY_AUTO_DETECT_SCOPE_KEY = "chzzkCategoryAutoDetectScope";
+const CATEGORY_AUTO_DETECT_ALLOWLIST_KEY = "chzzkCategoryAutoDetectAllowlist";
 const MEMO_SORT_ORDER_KEY = "chzzkMemoSortOrder";
+const EXPORT_FORMAT_OPTIONS_KEY = "chzzkExportFormatOptions";
+const DEFAULT_EXPORT_FORMAT_OPTIONS = {
+  includeStreamer: true,
+  includeTitle: true,
+  includeDate: true,
+  includeCategoryMetaTimes: true
+};
 /** 팝업에서 라이브 세션을 컨텍스트와 퍼지 매칭할 때 (`content.js`와 동일한 2시간 창) */
 const LIVE_CTX_FUZZY_MS = 2 * 60 * 60 * 1000;
 
@@ -57,8 +66,26 @@ const popupBindStatus = document.getElementById("popup-bind-status");
 const floatToggleMemo = document.getElementById("float-toggle-memo");
 const floatToggleBind = document.getElementById("float-toggle-bind");
 const categoryAutoDetectCheck = document.getElementById("category-auto-detect");
+const categoryAutoDetectSubopts = document.getElementById("category-auto-detect-subopts");
+const categoryAutoDetectAllowlistOnlyCheck = document.getElementById("category-auto-detect-allowlist-only");
+const categoryAutoDetectAllowlistDisclosure = document.getElementById(
+  "category-auto-detect-allowlist-disclosure"
+);
+const categoryAutoDetectAllowlistHint = document.getElementById("category-auto-detect-allowlist-hint");
+const categoryAutoDetectAddBtn = document.getElementById("category-auto-detect-add-btn");
+const categoryAutoDetectAllowlistListEl = document.getElementById("category-auto-detect-allowlist-list");
+const categoryAutoDetectAllowlistEmptyEl = document.getElementById("category-auto-detect-allowlist-empty");
+const sessionBroadcastDateEl = document.getElementById("session-broadcast-date");
 const popupDockRow = document.getElementById("popup-dock-row");
 const openStandalonePopupBtn = document.getElementById("open-standalone-popup-btn");
+const exportFormatDisclosure = document.getElementById("export-format-disclosure");
+const exportOptStreamer = document.getElementById("export-opt-streamer");
+const exportOptTitle = document.getElementById("export-opt-title");
+const exportOptDate = document.getElementById("export-opt-date");
+const exportOptCategoryTimes = document.getElementById("export-opt-category-times");
+
+/** @type {typeof DEFAULT_EXPORT_FORMAT_OPTIONS} */
+let exportFormatOptions = { ...DEFAULT_EXPORT_FORMAT_OPTIONS };
 
 let sessions = [];
 /** @type {typeof DEFAULT_MEMO_HOTKEY | null} */
@@ -146,6 +173,90 @@ function isUsableStreamerName(v) {
 }
 
 /** 드롭다운 등: `스트리머 - 방송제목` 이면 방송 제목만 */
+function msToBroadcastDateString(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  const d = new Date(ms);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function deriveBroadcastDateForSession(session) {
+  if (session?.broadcastDate && /^\d{4}-\d{2}-\d{2}$/.test(session.broadcastDate)) {
+    return session.broadcastDate;
+  }
+  if (Number.isFinite(session?.liveStartMs) && session.liveStartMs > 0) {
+    return msToBroadcastDateString(session.liveStartMs);
+  }
+  if (Number.isFinite(session?.createdAt) && session.createdAt > 0) {
+    return msToBroadcastDateString(session.createdAt);
+  }
+  return null;
+}
+
+function compareSessionsByBroadcastDate(a, b) {
+  const da = deriveBroadcastDateForSession(a) || "";
+  const db = deriveBroadcastDateForSession(b) || "";
+  if (da !== db) return db.localeCompare(da);
+  return (b.updatedAt || 0) - (a.updatedAt || 0);
+}
+
+function migrateSessionsBroadcastDates(list) {
+  let changed = false;
+  const next = list.map((s) => {
+    const bd = deriveBroadcastDateForSession(s);
+    if (!bd || s.broadcastDate === bd) return s;
+    changed = true;
+    return { ...s, broadcastDate: bd };
+  });
+  return { sessions: next, changed };
+}
+
+function normalizeStreamerAllowKey(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "");
+}
+
+function normalizeCategoryAutoDetectAllowlist(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    let ent = null;
+    if (typeof item === "string") {
+      const streamerName = item.trim();
+      if (!streamerName || streamerName.length > 40) continue;
+      ent = {
+        id: crypto.randomUUID(),
+        liveId: null,
+        streamerName,
+        addedAt: Date.now()
+      };
+    } else if (item && typeof item === "object") {
+      const streamerName = String(item.streamerName || "").trim();
+      const liveId = String(item.liveId || "").trim() || null;
+      if (!streamerName && !liveId) continue;
+      ent = {
+        id: String(item.id || crypto.randomUUID()),
+        liveId,
+        streamerName: (streamerName || liveId || "").slice(0, 40),
+        addedAt: Number(item.addedAt) || Date.now()
+      };
+    }
+    if (!ent) continue;
+    const dedupeKey = ent.liveId
+      ? `live:${ent.liveId}`
+      : `name:${normalizeStreamerAllowKey(ent.streamerName)}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    out.push(ent);
+  }
+  return out.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+}
+
 function sessionBroadcastTitle(session) {
   const raw = String(session?.title || "")
     .replace(/\s+-\s+CHZZK.*$/i, "")
@@ -386,7 +497,7 @@ function renderSessionOptionsForStreamer(preserveSessionId) {
   sessionSelect.innerHTML = "";
   const key = streamerSelect.value;
   const grouped = groupSessionsByStreamer(sessions);
-  const list = (grouped[key] || []).slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  const list = (grouped[key] || []).slice().sort(compareSessionsByBroadcastDate);
   if (list.length === 0) {
     const opt = document.createElement("option");
     opt.value = "";
@@ -399,12 +510,27 @@ function renderSessionOptionsForStreamer(preserveSessionId) {
     opt.value = s.sessionId;
     const broadcast = sessionBroadcastTitle(s);
     const titleShort = broadcast.length > 60 ? `${broadcast.slice(0, 57)}…` : broadcast;
-    opt.textContent = titleShort;
+    const datePrefix = deriveBroadcastDateForSession(s);
+    opt.textContent = datePrefix ? `${datePrefix} · ${titleShort}` : titleShort;
     sessionSelect.appendChild(opt);
   }
   if (preserveSessionId && list.some((s) => s.sessionId === preserveSessionId)) {
     sessionSelect.value = preserveSessionId;
   }
+  updateSessionBroadcastDateLabel();
+}
+
+function updateSessionBroadcastDateLabel() {
+  if (!sessionBroadcastDateEl) return;
+  const session = getSelectedSession();
+  const bd = session ? deriveBroadcastDateForSession(session) : null;
+  if (!bd) {
+    sessionBroadcastDateEl.hidden = true;
+    sessionBroadcastDateEl.textContent = "";
+    return;
+  }
+  sessionBroadcastDateEl.hidden = false;
+  sessionBroadcastDateEl.textContent = `방송 날짜: ${bd}`;
 }
 
 function getSelectedSession() {
@@ -689,12 +815,14 @@ async function onImportFileSelected(e) {
   }
 
   const now = Date.now();
+  const importDate = new Date().toISOString().slice(0, 10);
   const session = {
-    sessionId: `import:${new Date().toISOString().slice(0, 10)}:${Math.random().toString(36).slice(2, 8)}`,
+    sessionId: `import:${importDate}:${Math.random().toString(36).slice(2, 8)}`,
     source: "import",
     sourceId: file.name,
     streamerName: "imported",
     title: file.name.replace(/\.txt$/i, ""),
+    broadcastDate: importDate,
     createdAt: now,
     updatedAt: now,
     entries: parsedEntries
@@ -715,20 +843,89 @@ async function onImportFileSelected(e) {
   setTimeout(() => (importBtn.textContent = "TXT Import"), 1000);
 }
 
-function buildExportText(session) {
+function normalizeExportFormatOptions(raw) {
+  const base = { ...DEFAULT_EXPORT_FORMAT_OPTIONS };
+  if (!raw || typeof raw !== "object") return base;
+  return {
+    includeStreamer: raw.includeStreamer !== false,
+    includeTitle: raw.includeTitle !== false,
+    includeDate: raw.includeDate !== false,
+    includeCategoryMetaTimes: raw.includeCategoryMetaTimes !== false
+  };
+}
+
+function readExportFormatOptionsFromUi() {
+  return {
+    includeStreamer: exportOptStreamer?.checked !== false,
+    includeTitle: exportOptTitle?.checked !== false,
+    includeDate: exportOptDate?.checked !== false,
+    includeCategoryMetaTimes: exportOptCategoryTimes?.checked !== false
+  };
+}
+
+function applyExportFormatOptionsToUi(opts) {
+  const o = normalizeExportFormatOptions(opts);
+  if (exportOptStreamer) exportOptStreamer.checked = o.includeStreamer;
+  if (exportOptTitle) exportOptTitle.checked = o.includeTitle;
+  if (exportOptDate) exportOptDate.checked = o.includeDate;
+  if (exportOptCategoryTimes) exportOptCategoryTimes.checked = o.includeCategoryMetaTimes;
+}
+
+async function loadExportFormatOptionsFromStorage() {
+  const stored = await getStorage(EXPORT_FORMAT_OPTIONS_KEY, null);
+  exportFormatOptions = normalizeExportFormatOptions(stored);
+  applyExportFormatOptionsToUi(exportFormatOptions);
+}
+
+async function persistExportFormatOptionsFromUi() {
+  exportFormatOptions = normalizeExportFormatOptions(readExportFormatOptionsFromUi());
+  if (exportOptStreamer) exportOptStreamer.checked = exportFormatOptions.includeStreamer;
+  if (exportOptTitle) exportOptTitle.checked = exportFormatOptions.includeTitle;
+  if (exportOptDate) exportOptDate.checked = exportFormatOptions.includeDate;
+  if (exportOptCategoryTimes) exportOptCategoryTimes.checked = exportFormatOptions.includeCategoryMetaTimes;
+  await chrome.storage.local.set({ [EXPORT_FORMAT_OPTIONS_KEY]: exportFormatOptions });
+}
+
+function formatEntryExportLine(e, sortedAsc, opts = exportFormatOptions) {
+  if (e.type === "category") {
+    const label = categoryEntryTypeLabel(e, sortedAsc);
+    const body = getCategoryEntryDisplayBody(e) || "";
+    const core = body ? `${label} ${body}` : label;
+    if (opts.includeCategoryMetaTimes) {
+      return `${formatHms(e.sec)} [${core}]`.trim();
+    }
+    const bracket = body || label;
+    return `[${bracket}]`;
+  }
+  const t = (e.text || "").trim();
+  return `${formatHms(e.sec)} ${t}`.trimEnd();
+}
+
+function buildExportText(session, opts = exportFormatOptions) {
+  const o = normalizeExportFormatOptions(opts);
   const entries = (session.entries || []).slice().sort((a, b) => a.sec - b.sec);
   const lines = [];
+  const bd = deriveBroadcastDateForSession(session);
+  const title = sessionBroadcastTitle(session);
+  const streamer = inferStreamerKey(session);
+  if (o.includeStreamer && streamer && streamer !== "기타") {
+    lines.push(`# 스트리머: ${streamer}`);
+  }
+  if (o.includeTitle && title) {
+    lines.push(`# 방송: ${title}`);
+  }
+  if (o.includeDate && bd) {
+    lines.push(`# 날짜: ${bd}`);
+  }
+  const headerCount = lines.length;
+  if (headerCount) lines.push("");
 
   for (const e of entries) {
-    if (e.type === "category") {
-      const catBody = getCategoryEntryDisplayBody(e) || "카테고리";
-      lines.push(`[${catBody}]`);
-      continue;
-    }
-    const t = (e.text || "").trim();
-    lines.push(`${formatHms(e.sec)} ${t}`.trimEnd());
+    lines.push(formatEntryExportLine(e, entries, o));
   }
-  return lines.join("\n");
+  const body = lines.slice(headerCount ? headerCount + 1 : 0);
+  if (!body.length && !headerCount) return "";
+  return lines.join("\n").trim() + "\n";
 }
 
 function flushImportMemoBlob(blobLines, out, lastSecHolder) {
@@ -766,21 +963,57 @@ function parseImportText(text) {
   for (const raw of normalized.split("\n")) {
     const line = raw.trim();
     if (!line) continue;
+    if (/^#\s*/.test(line)) continue;
+
+    const timedCat = line.match(/^(\d{1,2}:\d{2}(?::\d{2})?)\s+\[([^\]]+)\]\s*(.*)$/);
+    if (timedCat) {
+      flushImportMemoBlob(blobLines, out, lastSecHolder);
+      const sec = parseHmsToSec(timedCat[1]);
+      if (sec == null) continue;
+      lastSecHolder.sec = sec;
+      const inner = timedCat[2].trim();
+      const rest = (timedCat[3] || "").trim();
+      const labelBody = rest ? `${inner} ${rest}`.trim() : inner;
+      const parsed = parseCategoryImportLabelBody(labelBody, sec);
+      out.push(parsed);
+      continue;
+    }
+
     const cat = line.match(/^\[(.+)\]$/);
     if (cat) {
       flushImportMemoBlob(blobLines, out, lastSecHolder);
-      out.push({
-        id: crypto.randomUUID(),
-        type: "category",
-        sec: lastSecHolder.sec,
-        text: cat[1].trim()
-      });
+      const parsed = parseCategoryImportLabelBody(cat[1].trim(), lastSecHolder.sec);
+      out.push(parsed);
       continue;
     }
     blobLines.push(line);
   }
   flushImportMemoBlob(blobLines, out, lastSecHolder);
   return out;
+}
+
+/** `HH:MM:SS [방제 변경] 제목` / `[카테고리명]` 등 가져오기 */
+function parseCategoryImportLabelBody(labelBody, sec) {
+  const raw = String(labelBody || "").trim();
+  let autoMeta;
+  let text = raw;
+  if (/^방제 변경(?:\s*[·|]\s*|\s+)/.test(raw)) {
+    autoMeta = "title";
+    text = raw.replace(/^방제 변경(?:\s*[·|]\s*|\s+)/, "").trim();
+  } else if (/^카테고리\/방제 변경(?:\s*[·|]\s*|\s+)/.test(raw)) {
+    autoMeta = "both";
+    text = raw.replace(/^카테고리\/방제 변경(?:\s*[·|]\s*|\s+)/, "").trim();
+  } else if (/^카테고리 변경(?:\s*[·|]\s*|\s+)/.test(raw)) {
+    text = raw.replace(/^카테고리 변경(?:\s*[·|]\s*|\s+)/, "").trim();
+  }
+  const entry = {
+    id: crypto.randomUUID(),
+    type: "category",
+    sec: Math.max(0, Math.floor(sec)),
+    text
+  };
+  if (autoMeta === "title" || autoMeta === "both") entry.autoMeta = autoMeta;
+  return entry;
 }
 
 /**
@@ -884,6 +1117,7 @@ async function onCreateManualSession() {
     sourceId: "manual",
     streamerName,
     title,
+    broadcastDate: msToBroadcastDateString(now),
     createdAt: now,
     updatedAt: now,
     entries: []
@@ -966,6 +1200,9 @@ async function loadFloatTogglesFromStorage() {
   if (floatToggleBind) floatToggleBind.setAttribute("aria-pressed", v.showBind ? "true" : "false");
 }
 
+/** @type {Array<{ id: string, liveId: string | null, streamerName: string, addedAt: number }>} */
+let categoryAutoDetectAllowlist = [];
+
 async function loadCategoryAutoDetectFromStorage() {
   const raw = await getStorage(CATEGORY_AUTO_DETECT_KEY, true);
   const on = raw !== false;
@@ -973,6 +1210,165 @@ async function loadCategoryAutoDetectFromStorage() {
     categoryAutoDetectCheck.checked = on;
     categoryAutoDetectCheck.setAttribute("aria-checked", on ? "true" : "false");
   }
+  const scope = await getStorage(CATEGORY_AUTO_DETECT_SCOPE_KEY, "all");
+  const storedList = await getStorage(CATEGORY_AUTO_DETECT_ALLOWLIST_KEY, []);
+  const normalizedList = normalizeCategoryAutoDetectAllowlist(storedList);
+  if (JSON.stringify(normalizedList) !== JSON.stringify(storedList)) {
+    await chrome.storage.local.set({ [CATEGORY_AUTO_DETECT_ALLOWLIST_KEY]: normalizedList });
+  }
+  categoryAutoDetectAllowlist = normalizedList;
+  const allowlistOnly = scope === "allowlist";
+  if (categoryAutoDetectSubopts) {
+    categoryAutoDetectSubopts.hidden = !on;
+  }
+  if (categoryAutoDetectAllowlistOnlyCheck) {
+    categoryAutoDetectAllowlistOnlyCheck.checked = allowlistOnly;
+  }
+  if (categoryAutoDetectAddBtn) {
+    categoryAutoDetectAddBtn.disabled = !on;
+  }
+  renderCategoryAutoDetectAllowlist();
+  void refreshCategoryAutoDetectAllowlistHint();
+}
+
+function renderCategoryAutoDetectAllowlist() {
+  if (!categoryAutoDetectAllowlistListEl) return;
+  categoryAutoDetectAllowlistListEl.innerHTML = "";
+  const list = categoryAutoDetectAllowlist;
+  if (categoryAutoDetectAllowlistEmptyEl) {
+    categoryAutoDetectAllowlistEmptyEl.hidden = list.length > 0;
+  }
+  if (!list.length) return;
+
+  for (const item of list) {
+    const row = document.createElement("div");
+    row.className = "cmm-allowlist-row";
+    row.setAttribute("role", "listitem");
+
+    const main = document.createElement("div");
+    main.className = "cmm-allowlist-row-main";
+    const nameEl = document.createElement("span");
+    nameEl.className = "cmm-allowlist-name";
+    nameEl.textContent = item.streamerName || item.liveId || "채널";
+    main.appendChild(nameEl);
+    if (item.liveId) {
+      const sub = document.createElement("span");
+      sub.className = "cmm-allowlist-sub";
+      sub.textContent = `채널 ID · ${item.liveId}`;
+      main.appendChild(sub);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "cmm-allowlist-row-actions";
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "btn-danger entry-action-btn cmm-allowlist-del-btn";
+    delBtn.textContent = "삭제";
+    delBtn.addEventListener("click", () => void onRemoveCategoryAutoDetectAllowlistItem(item.id));
+
+    actions.appendChild(delBtn);
+    row.append(main, actions);
+    categoryAutoDetectAllowlistListEl.appendChild(row);
+  }
+}
+
+async function refreshCategoryAutoDetectAllowlistHint() {
+  if (!categoryAutoDetectAllowlistHint) return;
+  const live = await resolveActiveLiveChannelForAllowlist();
+  if (live?.streamerName) {
+    categoryAutoDetectAllowlistHint.textContent = `지금 보는 채널: ${live.streamerName} — 「현재 채널 추가」로 목록에 넣을 수 있습니다.`;
+    return;
+  }
+  categoryAutoDetectAllowlistHint.innerHTML =
+    "치지직 <strong>라이브</strong> 페이지를 연 뒤 「현재 채널 추가」를 누르세요.";
+}
+
+async function resolveActiveLiveChannelForAllowlist() {
+  const ctx = await getStorage(ACTIVE_PAGE_CONTEXT_KEY, null);
+  if (ctx?.mode === "live" && ctx.liveId) {
+    const parsed = ctx.pageTitle ? parseChzzkPageTitleForSession(ctx.pageTitle) : null;
+    const streamerName = String(ctx.streamerName || parsed?.streamerName || "").trim();
+    return {
+      liveId: String(ctx.liveId),
+      streamerName: streamerName || String(ctx.liveId)
+    };
+  }
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.url) return null;
+    const u = new URL(tab.url);
+    if (!/chzzk\.naver\.com$/i.test(u.hostname)) return null;
+    const m = u.pathname.match(/^\/live\/([^/?#]+)/);
+    if (!m) return null;
+    const title = String(tab.title || "").replace(/\s+-\s+CHZZK.*/i, "").trim();
+    const parsed = title ? parseChzzkPageTitleForSession(title) : null;
+    return {
+      liveId: m[1],
+      streamerName: String(parsed?.streamerName || "").trim() || m[1]
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function saveCategoryAutoDetectScopeFromUi() {
+  const allowlistOnly = Boolean(categoryAutoDetectAllowlistOnlyCheck?.checked);
+  const scope = allowlistOnly ? "allowlist" : "all";
+  await chrome.storage.local.set({ [CATEGORY_AUTO_DETECT_SCOPE_KEY]: scope });
+}
+
+async function persistCategoryAutoDetectAllowlist(list) {
+  categoryAutoDetectAllowlist = normalizeCategoryAutoDetectAllowlist(list);
+  await chrome.storage.local.set({
+    [CATEGORY_AUTO_DETECT_ALLOWLIST_KEY]: categoryAutoDetectAllowlist
+  });
+  renderCategoryAutoDetectAllowlist();
+}
+
+async function onAddCurrentChannelToCategoryAutoDetectAllowlist() {
+  const live = await resolveActiveLiveChannelForAllowlist();
+  if (!live?.liveId) {
+    await openConfirmModal(
+      "치지직 라이브(/live/…) 페이지를 연 탭에서 팝업을 열고 다시 시도해 주세요.",
+      { confirmOnly: true, okLabel: "확인" }
+    );
+    return;
+  }
+  const next = normalizeCategoryAutoDetectAllowlist([
+    ...categoryAutoDetectAllowlist,
+    {
+      id: crypto.randomUUID(),
+      liveId: live.liveId,
+      streamerName: live.streamerName,
+      addedAt: Date.now()
+    }
+  ]);
+  const added = next.length - categoryAutoDetectAllowlist.length;
+  await persistCategoryAutoDetectAllowlist(next);
+  if (categoryAutoDetectAddBtn) {
+    categoryAutoDetectAddBtn.textContent = added > 0 ? "추가됨" : "이미 있음";
+    setTimeout(() => {
+      categoryAutoDetectAddBtn.textContent = "현재 채널 추가";
+    }, 1200);
+  }
+  if (!categoryAutoDetectAllowlistOnlyCheck?.checked) {
+    categoryAutoDetectAllowlistOnlyCheck.checked = true;
+    await saveCategoryAutoDetectScopeFromUi();
+    await loadCategoryAutoDetectFromStorage();
+  }
+}
+
+async function onRemoveCategoryAutoDetectAllowlistItem(itemId) {
+  const target = categoryAutoDetectAllowlist.find((x) => x.id === itemId);
+  if (!target) return;
+  const ok = await openConfirmModal(
+    `「${target.streamerName || target.liveId}」을(를) 자동 감지 목록에서 삭제할까요?`,
+    { okLabel: "삭제", danger: true }
+  );
+  if (!ok) return;
+  await persistCategoryAutoDetectAllowlist(
+    categoryAutoDetectAllowlist.filter((x) => x.id !== itemId)
+  );
 }
 
 /** 활성 탭 URL 또는 콘텐츠 스크립트가 저장한 컨텍스트로 VOD id 판별 */
@@ -1267,6 +1663,11 @@ function openPromptModal(message, options = {}) {
 
 async function reloadSessionsFromStorage() {
   sessions = await getStorage(STORAGE_KEY, []);
+  const migrated = migrateSessionsBroadcastDates(sessions);
+  sessions = migrated.sessions;
+  if (migrated.changed) {
+    await chrome.storage.local.set({ [STORAGE_KEY]: sessions });
+  }
   sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   const prevStreamer = streamerSelect.value;
   const prevSession = sessionSelect.value;
@@ -1283,6 +1684,7 @@ async function reloadSessionsFromStorage() {
     if (sessionSelect.options[0]?.value) sessionSelect.selectedIndex = 0;
   }
   renderEntryList();
+  updateSessionBroadcastDateLabel();
 
   const sessionStillValid = Boolean(prevSession && sessions.some((s) => s.sessionId === prevSession));
   if (prevSession && !sessionStillValid) {
@@ -1419,9 +1821,14 @@ async function init() {
   sessionSelect.addEventListener("change", () => {
     editingEntryId = null;
     renderEntryList();
+    updateSessionBroadcastDateLabel();
   });
   copyBtn.addEventListener("click", () => void onCopy());
   exportBtn.addEventListener("click", () => void onExport());
+
+  for (const el of [exportOptStreamer, exportOptTitle, exportOptDate, exportOptCategoryTimes]) {
+    el?.addEventListener("change", () => void persistExportFormatOptionsFromUi());
+  }
   importBtn.addEventListener("click", () => importFile.click());
   importFile.addEventListener("change", (ev) => void onImportFileSelected(ev));
   deleteSessionBtn.addEventListener("click", () => void onDeleteSession());
@@ -1451,6 +1858,7 @@ async function init() {
   applyEntrySortUi();
 
   await loadFloatTogglesFromStorage();
+  await loadExportFormatOptionsFromStorage();
   await loadCategoryAutoDetectFromStorage();
   await refreshPopupVodBindPanel();
   await applyActivePageContextSelection(await getStorage(ACTIVE_PAGE_CONTEXT_KEY, null));
@@ -1459,7 +1867,17 @@ async function init() {
     const on = categoryAutoDetectCheck.checked;
     categoryAutoDetectCheck.setAttribute("aria-checked", on ? "true" : "false");
     await chrome.storage.local.set({ [CATEGORY_AUTO_DETECT_KEY]: on });
+    await loadCategoryAutoDetectFromStorage();
   });
+
+  categoryAutoDetectAllowlistOnlyCheck?.addEventListener("change", async () => {
+    await saveCategoryAutoDetectScopeFromUi();
+    await loadCategoryAutoDetectFromStorage();
+  });
+
+  categoryAutoDetectAddBtn?.addEventListener("click", () =>
+    void onAddCurrentChannelToCategoryAutoDetectAllowlist()
+  );
 
   floatToggleMemo?.addEventListener("click", async () => {
     const cur = normalizePlayerToolsVisibility(
@@ -1496,6 +1914,15 @@ async function init() {
     if (changes[CATEGORY_AUTO_DETECT_KEY]) {
       void loadCategoryAutoDetectFromStorage();
     }
+    if (changes[CATEGORY_AUTO_DETECT_SCOPE_KEY] || changes[CATEGORY_AUTO_DETECT_ALLOWLIST_KEY]) {
+      void loadCategoryAutoDetectFromStorage();
+    }
+    if (changes[EXPORT_FORMAT_OPTIONS_KEY]) {
+      void loadExportFormatOptionsFromStorage();
+    }
+    if (changes[ACTIVE_PAGE_CONTEXT_KEY]) {
+      void refreshCategoryAutoDetectAllowlistHint();
+    }
   });
 
   document.addEventListener("visibilitychange", () => {
@@ -1503,6 +1930,7 @@ async function init() {
     void (async () => {
       await applyActivePageContextSelection(await getStorage(ACTIVE_PAGE_CONTEXT_KEY, null));
       await refreshPopupVodBindPanel();
+      await refreshCategoryAutoDetectAllowlistHint();
     })();
   });
 }

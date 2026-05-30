@@ -218,11 +218,18 @@
   gap: 4px;
 }
 
+.cmm-cluster-pop-item-wrap {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+}
+
 .cmm-cluster-pop-item {
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   margin: 0;
   padding: 8px 10px;
   border: 0;
@@ -257,6 +264,27 @@
   line-height: 1.4;
   color: #e2e8f0;
   word-break: break-word;
+}
+
+.cmm-cluster-pop-del {
+  flex: 0 0 auto;
+  width: 32px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.15);
+  transition: background-color 0.15s ease;
+}
+
+.cmm-cluster-pop-del:hover,
+.cmm-cluster-pop-del:focus-visible {
+  background: rgba(239, 68, 68, 0.35);
+  outline: none;
 }
 
 #cmm-editor-panel,

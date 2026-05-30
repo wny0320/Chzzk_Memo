@@ -176,6 +176,82 @@ body.cmm-dock-window #entry-list.entry-list {
   accent-color: #38bdf8;
 }
 
+.cmm-checkbox-setting--nested {
+  margin-top: 8px;
+  padding-left: 8px;
+  font-size: 12px;
+  color: #cbd5e1;
+}
+
+.category-auto-detect-subopts {
+  margin-top: 4px;
+}
+
+.category-auto-detect-subopts .cmm-allowlist-disclosure {
+  margin-top: 8px;
+}
+
+.cmm-allowlist-actions {
+  margin: 8px 0 10px;
+}
+
+.cmm-allowlist-add-btn {
+  width: 100%;
+}
+
+.cmm-allowlist-list {
+  max-height: 140px;
+  overflow-y: auto;
+  border: 1px solid #374151;
+  border-radius: 8px;
+  background: #111827;
+}
+
+.cmm-allowlist-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(55, 65, 81, 0.55);
+}
+
+.cmm-allowlist-row:last-child {
+  border-bottom: 0;
+}
+
+.cmm-allowlist-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.cmm-allowlist-name {
+  font-size: 13px;
+  color: #f3f4f6;
+  word-break: break-word;
+}
+
+.cmm-allowlist-sub {
+  font-size: 10px;
+  color: #9ca3af;
+  word-break: break-all;
+}
+
+.cmm-allowlist-row-actions {
+  flex: 0 0 auto;
+}
+
+.cmm-allowlist-del-btn {
+  font-size: 11px;
+  padding: 6px 8px;
+}
+
+.session-broadcast-date {
+  margin: -4px 0 8px;
+}
+
 #hk-capture.active {
   outline: 2px solid #38bdf8;
   outline-offset: 2px;
@@ -414,6 +490,60 @@ select {
   padding: 7px 6px;
   line-height: 1.2;
   white-space: nowrap;
+}
+
+.cmm-collapsible-disclosure {
+  margin: 0 0 8px;
+  border: 1px solid rgba(55, 65, 81, 0.85);
+  border-radius: 8px;
+  background: rgba(17, 24, 39, 0.55);
+}
+
+.cmm-collapsible-disclosure[open] {
+  background: rgba(17, 24, 39, 0.85);
+}
+
+.cmm-collapsible-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #e5e7eb;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.cmm-collapsible-summary::-webkit-details-marker {
+  display: none;
+}
+
+.cmm-collapsible-summary::before {
+  content: "▸";
+  font-size: 11px;
+  color: #9ca3af;
+  transition: transform 0.15s ease;
+}
+
+.cmm-collapsible-disclosure[open] .cmm-collapsible-summary::before {
+  transform: rotate(90deg);
+}
+
+.cmm-collapsible-body {
+  padding: 0 10px 10px;
+  border-top: 1px solid rgba(55, 65, 81, 0.55);
+}
+
+.cmm-export-format-body .hint,
+.cmm-allowlist-disclosure-body .hint {
+  margin: 8px 0 6px;
+}
+
+.cmm-export-format-opt {
+  margin-top: 6px;
+  font-size: 12px;
 }
 
 .actions {
