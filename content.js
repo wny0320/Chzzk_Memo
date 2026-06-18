@@ -563,6 +563,7 @@ function clearMarkerUiPointerListeners() {
 }
 
 const CMM_COMMENT_ROW_SELECTORS = [
+  "[id^='commentBox-']",
   "[class*='comment_list'] li",
   "[class*='CommentList'] li",
   "[class*='comment-list'] li",
@@ -578,6 +579,16 @@ const CMM_COMMENT_ROW_SELECTORS = [
   "article[class*='comment']",
   "main [class*='Comment'] [class*='item']"
 ];
+
+const CMM_COMMENT_TEXT_SELECTORS = [
+  ":scope > [class*='_content_'] > [class*='_text_']",
+  "[class*='_content_'] > [class*='_text_']",
+  ":scope > .comment_item_content__QxOPL .comment_item_text__c6NLq",
+  ".comment_item_content__QxOPL .comment_item_text__c6NLq",
+  "[class*='comment_item_text__']"
+];
+
+const CMM_COMMENT_TIMELINE_BUTTON_SELECTOR = "button[class*='_time_'], button[class*='_Time_']";
 
 const CMM_REPLY_SUBTREE_SELECTORS = [
   "[class*='reply_list']",
@@ -598,12 +609,32 @@ function delay(ms) {
 
 function getMainCommentTextElement(root) {
   if (!root) return null;
-  return (
-    root.querySelector(":scope > .comment_item_content__QxOPL .comment_item_text__c6NLq") ||
-    root.querySelector(".comment_item_content__QxOPL .comment_item_text__c6NLq") ||
-    root.querySelector("[class*='comment_item_text__']") ||
-    null
-  );
+  for (const sel of CMM_COMMENT_TEXT_SELECTORS) {
+    try {
+      const hit = root.querySelector(sel);
+      if (hit) return hit;
+    } catch (_) {
+      /* invalid selector */
+    }
+  }
+  return null;
+}
+
+function getCommentRowElementById(el) {
+  if (!el?.closest) return null;
+  return el.closest("[id^='commentBox-']");
+}
+
+function commentRowHasImportableTimelines(root) {
+  const textEl = getMainCommentTextElement(root);
+  if (textEl) {
+    try {
+      if (textEl.querySelector(CMM_COMMENT_TIMELINE_BUTTON_SELECTOR)) return true;
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  return scanTimelinesInString(getCommentTimelineProbeText(root)).length > 0;
 }
 
 function isCommentExpandMoreButton(el) {
@@ -624,6 +655,7 @@ function isCommentOverflowMenuButton(el) {
   const hasBlindMore = Boolean(
     el.querySelector(".blind") && /더보기|more/i.test((el.querySelector(".blind")?.textContent || "").trim())
   );
+  if (/_button_more_/i.test(className) && hasSvg) return true;
   if (/comment_item_button_more__/i.test(className) && (hasSvg || hasBlindMore)) return true;
   if (raw === "..." || raw === "⋯" || raw === "⋮" || raw === "︙") return true;
   const ar = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""}`.toLowerCase();
@@ -635,17 +667,27 @@ function isCommentOverflowMenuButton(el) {
 
 /** 답글 스레드 안의 노드면 true (본편 댓글만 처리) */
 function isInsideReplyThread(el) {
+  const commentBox = getCommentRowElementById(el);
+  if (commentBox) {
+    const parentBox = commentBox.parentElement?.closest("[id^='commentBox-']");
+    return Boolean(parentBox);
+  }
   const li = el.closest("li");
   if (!li) return false;
   return Boolean(li.parentElement?.closest("li"));
 }
 
 /**
- * 메모로 버튼·텍스트 추출 기준 루트. 답글 li 안이면 null.
- * li 레이아웃이면 최상위 본댓 li.
+ * 메모로 버튼·텍스트 추출 기준 루트. 답글 안이면 null.
+ * 치지직 2026 UI는 `commentBox-*` div, 구 UI는 본댓 li.
  */
 function getStableCommentRowRoot(el) {
   if (!el) return null;
+  const commentBox = getCommentRowElementById(el);
+  if (commentBox) {
+    if (isInsideReplyThread(commentBox)) return null;
+    return commentBox;
+  }
   if (isInsideReplyThread(el)) return null;
   const li = el.closest("li");
   if (li) return li;
@@ -695,15 +737,30 @@ function isCommentControlInReplyBranch(root, el) {
   return !!(anchor && root.contains(anchor));
 }
 
-/** 본문 접기 `더보기`를 끝까지 클릭해 펼침 (답글 영역 버튼은 제외) */
+/** 본문 접기 `더보기`를 끝까지 클릭해 펼침 (답글 영역·헤더 ⋯ 메뉴 버튼은 제외) */
 async function expandCommentMainContent(root) {
   if (!root) return;
   const textEl = getMainCommentTextElement(root);
   if (!textEl) return;
   const maxPasses = 12;
   for (let pass = 0; pass < maxPasses; pass++) {
-    const candidates = textEl.querySelectorAll("button, [role='button'], a, span[role='button']");
     let clicked = false;
+    const textExpandors = textEl.querySelectorAll("button[class*='_button_more_'], button[class*='button_more']");
+    for (const b of textExpandors) {
+      if (!textEl.contains(b) || b.classList.contains("cmm-comment-import-btn")) continue;
+      if (!isCommentExpandMoreButton(b)) continue;
+      try {
+        b.click();
+        clicked = true;
+        await delay(400);
+        break;
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    if (clicked) continue;
+
+    const candidates = textEl.querySelectorAll("button, [role='button'], a, span[role='button']");
     for (const b of candidates) {
       if (!textEl.contains(b) || b.classList.contains("cmm-comment-import-btn")) continue;
       if (isCommentControlInReplyBranch(textEl, b)) continue;
@@ -783,6 +840,52 @@ function scanTimelinesInString(raw) {
   return out;
 }
 
+/** 치지직 2026 UI: `button._time_*` 기준으로 시각·메모 쌍 추출 */
+function extractCommentTimelineEntriesFromDom(root) {
+  const textEl = getMainCommentTextElement(root);
+  if (!textEl) return [];
+  let buttons = [];
+  try {
+    buttons = Array.from(textEl.querySelectorAll(CMM_COMMENT_TIMELINE_BUTTON_SELECTOR)).filter(
+      (b) => !b.classList.contains("cmm-comment-import-btn")
+    );
+  } catch (_) {
+    return [];
+  }
+  if (!buttons.length) return [];
+
+  const entries = [];
+  for (let i = 0; i < buttons.length; i++) {
+    const btn = buttons[i];
+    const sec = parseClockTextToSec((btn.textContent || "").trim());
+    if (!Number.isFinite(sec) || sec < 0) continue;
+
+    const memoParts = [];
+    let node = btn.nextSibling;
+    const nextBtn = buttons[i + 1] || null;
+    while (node) {
+      if (node === nextBtn) break;
+      if (node.nodeType === Node.TEXT_NODE) {
+        memoParts.push(node.textContent || "");
+      } else if (node.nodeType === Node.ELEMENT_NODE) {
+        if (node.matches?.("button[class*='_button_more_'], button[class*='button_more']")) {
+          if (isCommentExpandMoreButton(node)) break;
+        }
+        if (node.matches?.(CMM_COMMENT_TIMELINE_BUTTON_SELECTOR)) break;
+        if (node.tagName === "BR") {
+          memoParts.push(" ");
+        } else {
+          memoParts.push(node.textContent || "");
+        }
+      }
+      node = node.nextSibling;
+    }
+    const memo = sanitizeTimelineMemoChunk(memoParts.join("").replace(/\s+/g, " "));
+    entries.push({ sec, memo });
+  }
+  return entries;
+}
+
 /** 치지직 댓글/탐라 덤프에서 시각 오른쪽 구간만 메모 본문으로 정리 */
 function sanitizeTimelineMemoChunk(raw) {
   let t = String(raw || "").replace(/\u00a0/g, " ");
@@ -832,7 +935,7 @@ function isLikelyCommentRow(el) {
   if (!root) return false;
   const t = getCommentTimelineProbeText(root);
   if (t.length < 3 || t.length > 50000) return false;
-  if (scanTimelinesInString(t).length === 0) return false;
+  if (!commentRowHasImportableTimelines(root)) return false;
   if (root.querySelector(".cmm-comment-import-btn")) return false;
   if (root.dataset.cmmCommentHooked === "1") return false;
   if (!findCommentRowOverflowMenuButton(root)) return false;
@@ -863,6 +966,13 @@ function gatherVodCommentRowElements() {
     }
   }
   if (roots.size === 0) {
+    try {
+      document.querySelectorAll("[id^='commentBox-']").forEach((node) => tryNode(node));
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  if (roots.size === 0) {
     const main = document.querySelector("main");
     if (main) {
       let n = 0;
@@ -883,6 +993,10 @@ function gatherVodCommentRowElements() {
  */
 function findCommentRowOverflowMenuButton(row) {
   if (!row) return null;
+  const headerMore = row.querySelector(
+    "[class*='_header_'] [class*='_more_'] button, [class*='_header_'] [class*='_more_'] [role='button']"
+  );
+  if (headerMore && isCommentOverflowMenuButton(headerMore)) return headerMore;
   const header = row.querySelector(":scope > .comment_item_header__kLcEu .comment_item_more__ceoL8");
   if (header) {
     const headerButtons = Array.from(header.querySelectorAll("button, [role='button'], a"));
@@ -905,7 +1019,7 @@ function findCommentRowOverflowMenuButton(row) {
     if (/메뉴|more|menu|ellipsis|신고|차단|options|option/i.test(ar)) return b;
   }
   const byClass = row.querySelector(
-    "button[class*='comment_item_button_more__'], [class*='MoreButton'], [class*='more_button'], [class*='BtnMore'], [class*='MenuButton'], [class*='menu_btn']"
+    "button[class*='comment_item_button_more__'], button[class*='_button_more_'], [class*='MoreButton'], [class*='more_button'], [class*='BtnMore'], [class*='MenuButton'], [class*='menu_btn']"
   );
   if (
     byClass &&
@@ -935,11 +1049,10 @@ function attachCommentImportButton(row) {
   if (root.dataset.cmmCommentHooked === "1") return;
   const menuBtn = findCommentRowOverflowMenuButton(root);
   if (!menuBtn?.parentNode) return;
-  const sourceText = getCommentTimelineProbeText(root);
-  if (scanTimelinesInString(sourceText).length === 0) return;
+  if (!commentRowHasImportableTimelines(root)) return;
 
   root.dataset.cmmCommentHooked = "1";
-  root.dataset.cmmCommentSource = sourceText;
+  root.dataset.cmmCommentSource = getCommentTimelineProbeText(root);
 
   const btn = document.createElement("button");
   btn.type = "button";
@@ -987,11 +1100,17 @@ function stopCommentImportFeature() {
   });
 }
 
+function findVodCommentListObserverRoot() {
+  const sample = document.querySelector("[id^='commentBox-']");
+  if (sample?.parentElement) return sample.parentElement;
+  return document.querySelector("main") || document.body;
+}
+
 function startCommentImportFeature() {
   stopCommentImportFeature();
   if (!pageInfo.isChzzk || pageInfo.mode !== "vod" || !pageInfo.vodId) return;
   scanAndAttachCommentImportButtons();
-  const root = document.querySelector("main") || document.body;
+  const root = findVodCommentListObserverRoot();
   try {
     commentImportObserver = new MutationObserver(() => scheduleCommentImportScan());
     commentImportObserver.observe(root, { childList: true, subtree: true });
@@ -1006,18 +1125,45 @@ async function importCommentRowToVodSession(row) {
   if (!root) return;
   await expandCommentMainContent(root);
   await delay(280);
-  const source = getCommentMainBodyText(root);
-  const matches = scanTimelinesInString(source);
-  if (matches.length === 0) {
-    toast("타임라인(H:MM:SS 또는 M:SS 등)을 찾을 수 없습니다.");
-    return;
-  }
+
   let session = await getConsolidatedVodSession();
   if (!session) {
     toast("세션을 불러올 수 없습니다.");
     return;
   }
   session = await ensureVodSessionBroadcastDate(session);
+
+  const domEntries = extractCommentTimelineEntriesFromDom(root);
+  if (domEntries.length) {
+    let added = 0;
+    let skippedDup = 0;
+    for (const { sec, memo } of domEntries) {
+      if (!memo) continue;
+      const ok = await appendEntry(session, "memo", memo, sec);
+      if (ok) added += 1;
+      else skippedDup += 1;
+    }
+    if (added === 0) {
+      if (skippedDup > 0) {
+        toast("이미 등록된 메모만 있어 추가하지 않았습니다.");
+      } else {
+        toast("추출된 메모 본문이 없습니다.");
+      }
+      return;
+    }
+    toast(added > 1 ? `메모 ${added}건 추가됨` : "메모에 추가됨");
+    lastPublishedPageContextJson = "";
+    await publishActivePageContext();
+    safeRenderVodMarkers();
+    return;
+  }
+
+  const source = getCommentMainBodyText(root);
+  const matches = scanTimelinesInString(source);
+  if (matches.length === 0) {
+    toast("타임라인(H:MM:SS 또는 M:SS 등)을 찾을 수 없습니다.");
+    return;
+  }
   let added = 0;
   let skippedDup = 0;
   for (let i = 0; i < matches.length; i++) {
@@ -1608,29 +1754,47 @@ function deriveBroadcastDateForSession(session) {
   return msToBroadcastDateString(Date.now());
 }
 
+const CMM_VOD_INFO_TEXT_SELECTORS = [
+  "span[class*='_label_']",
+  "[class*='_label_']",
+  "[class*='video_information_label']",
+  "[class*='video_information_data']",
+  "[class*='video_information_type_vod']",
+  "[class*='video_information_count']",
+  "span[class*='_count_']"
+];
+
+const CMM_VOD_INFO_HOVER_TRIGGER_SELECTORS = [
+  "span[class*='_label_']",
+  "span[class*='_count_']",
+  "[class*='video_information_type_vod']",
+  "[class*='video_information_data']",
+  "span[class*='video_information_count']",
+  "[class*='video_information_count']"
+];
+
 function readVodVideoInformationTextBlob() {
   const parts = [];
+  const seen = new Set();
   const add = (raw) => {
     const s = String(raw || "")
       .replace(/\u00a0/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-    if (s) parts.push(s);
+    if (!s || seen.has(s)) return;
+    seen.add(s);
+    parts.push(s);
   };
-  const selectors = [
-    "[class*='video_information_label']",
-    "[class*='video_information_data']",
-    "[class*='video_information_type_vod']",
-    "[class*='video_information_count']"
-  ];
-  for (const sel of selectors) {
+  const addFromEl = (el) => {
+    if (!el) return;
+    add(el.innerText);
+    add(el.textContent);
+    add(el.getAttribute?.("title"));
+    add(el.getAttribute?.("aria-label"));
+  };
+  for (const sel of CMM_VOD_INFO_TEXT_SELECTORS) {
     try {
-      document.querySelectorAll(sel).forEach((el) => {
-        add(el.textContent);
-        add(el.innerText);
-        add(el.getAttribute?.("title"));
-        add(el.getAttribute?.("aria-label"));
-      });
+      document.querySelectorAll(sel).forEach((el) => addFromEl(el));
     } catch (_) {
       /* ignore */
     }
@@ -1640,14 +1804,7 @@ function readVodVideoInformationTextBlob() {
 
 /** VOD 상단 정보(조회수·등록일 줄)에 마우스를 올려야 툴팁/라벨이 채워지는 레이아웃 대비 */
 function nudgeVodVideoInformationHover() {
-  const triggers = document.querySelectorAll(
-    [
-      "[class*='video_information_type_vod']",
-      "[class*='video_information_data']",
-      "span[class*='video_information_count']",
-      "[class*='video_information_count']"
-    ].join(", ")
-  );
+  const triggers = document.querySelectorAll(CMM_VOD_INFO_HOVER_TRIGGER_SELECTORS.join(", "));
   for (const el of triggers) {
     if (!el?.dispatchEvent) continue;
     try {
@@ -1661,9 +1818,61 @@ function nudgeVodVideoInformationHover() {
   }
 }
 
+function parseVodLiveStartMdFromBlob(blob) {
+  return parseVodMdPairFromText(blob, /라이브\s*시작일\s*[:：]\s*(\d{1,2})\.(\d{1,2})/i);
+}
+
+function parseVodRegisteredMdFromBlob(blob) {
+  return (
+    parseVodMdPairFromText(blob, /등록일\s*[:：]\s*(\d{1,2})\.(\d{1,2})/i) ||
+    parseVodMdPairFromText(blob, /등록일\s*[:：]\s*(\d{4})\.(\d{1,2})\.(\d{1,2})/i)
+  );
+}
+
+function detectVodLiveStartBroadcastDateFromDom() {
+  const tryParseBlob = (blob) => {
+    const liveStart = parseVodLiveStartMdFromBlob(blob);
+    if (!liveStart) return null;
+    const registered = parseVodRegisteredMdFromBlob(blob);
+    const year = inferYearForVodMd(liveStart.month, liveStart.day, registered);
+    const m = String(liveStart.month).padStart(2, "0");
+    const d = String(liveStart.day).padStart(2, "0");
+    return `${year}-${m}-${d}`;
+  };
+
+  let blob = readVodVideoInformationTextBlob();
+  let hit = tryParseBlob(blob);
+  if (hit) return hit;
+
+  nudgeVodVideoInformationHover();
+  blob = readVodVideoInformationTextBlob();
+  hit = tryParseBlob(blob);
+  if (hit) return hit;
+
+  try {
+    for (const el of document.querySelectorAll("span[class*='_label_'], [class*='_label_']")) {
+      const piece = (el.innerText || el.textContent || "").replace(/\u00a0/g, " ");
+      hit = tryParseBlob(piece);
+      if (hit) return hit;
+    }
+  } catch (_) {
+    /* ignore */
+  }
+
+  return null;
+}
+
 function parseVodMdPairFromText(blob, labelRe) {
   const m = String(blob || "").match(labelRe);
   if (!m) return null;
+  if (m[3] != null) {
+    const month = Number(m[2]);
+    const day = Number(m[3]);
+    if (!Number.isFinite(month) || !Number.isFinite(day) || month < 1 || month > 12 || day < 1 || day > 31) {
+      return null;
+    }
+    return { month, day };
+  }
   const month = Number(m[1]);
   const day = Number(m[2]);
   if (!Number.isFinite(month) || !Number.isFinite(day) || month < 1 || month > 12 || day < 1 || day > 31) {
@@ -1686,23 +1895,6 @@ function inferYearForVodMd(month, day, registered = null) {
     if (now.getTime() - live.getTime() > 370 * 86400000) year += 1;
   }
   return year;
-}
-
-function detectVodLiveStartBroadcastDateFromDom() {
-  let blob = readVodVideoInformationTextBlob();
-  let liveStart = parseVodMdPairFromText(blob, /라이브\s*시작일\s*[:：]\s*(\d{1,2})\.(\d{1,2})/i);
-  let registered = parseVodMdPairFromText(blob, /등록일\s*[:：]\s*(\d{1,2})\.(\d{1,2})/i);
-  if (!liveStart) {
-    nudgeVodVideoInformationHover();
-    blob = readVodVideoInformationTextBlob();
-    liveStart = parseVodMdPairFromText(blob, /라이브\s*시작일\s*[:：]\s*(\d{1,2})\.(\d{1,2})/i);
-    registered = parseVodMdPairFromText(blob, /등록일\s*[:：]\s*(\d{1,2})\.(\d{1,2})/i);
-  }
-  if (!liveStart) return null;
-  const year = inferYearForVodMd(liveStart.month, liveStart.day, registered);
-  const m = String(liveStart.month).padStart(2, "0");
-  const d = String(liveStart.day).padStart(2, "0");
-  return `${year}-${m}-${d}`;
 }
 
 async function resolveVodBroadcastDate(options = {}) {
@@ -2475,6 +2667,15 @@ function getLiveVideoInformationRoot() {
       }
     }
   }
+  const streamingCount = findLiveStreamingCountSpan();
+  if (streamingCount) {
+    const fromCount =
+      streamingCount.closest(
+        "[class*='information'], [class*='Information'], [class*='broadcast'], [class*='Broadcast'], [class*='player'], [class*='Player'], [class*='header'], [class*='Header']"
+      ) || streamingCount.parentElement;
+    if (fromCount?.isConnected) return fromCount;
+  }
+
   return (
     document.querySelector("[class*='live_information_player_wrapper']") ||
     document.querySelector("[class*='live_information_player_information']") ||
@@ -2486,6 +2687,38 @@ function getLiveVideoInformationRoot() {
     document.querySelector("[class*='LiveHeader']") ||
     null
   );
+}
+
+/** 치지직 라이브 경과 시각 span (2026 UI: 일반 `_count_1nl77_81`, 넓은/전체화면 `_count_1ybo4_117` 등) */
+const CMM_LIVE_STREAMING_COUNT_SELECTORS = [
+  "span[class*='_count_']",
+  "span.video_information_count__Y05sI",
+  "span[class*='video_information_count']",
+  "span[class*='live_information_player_count']",
+  "strong[class*='live_information_player_count']",
+  "[class*='live_status'] span",
+  "[class*='LiveStatus'] span"
+];
+
+const CMM_LIVE_STREAMING_CLOCK_LABEL_RE =
+  /스트리밍|streaming|broadcast|방송\s*중|on\s*air|\blive\b|라이브|경과|uptime|진행/i;
+
+function findLiveStreamingCountSpan() {
+  for (const sel of CMM_LIVE_STREAMING_COUNT_SELECTORS) {
+    let list;
+    try {
+      list = document.querySelectorAll(sel);
+    } catch (_) {
+      continue;
+    }
+    for (const el of list) {
+      const t = (el.textContent || "").replace(/\u00a0/g, " ").trim();
+      if (!t || !CMM_LIVE_STREAMING_CLOCK_LABEL_RE.test(t)) continue;
+      if (parseClockTextToSec(t) == null) continue;
+      return el;
+    }
+  }
+  return null;
 }
 
 /**
@@ -2517,22 +2750,10 @@ function getLiveElapsedSecondFromDom() {
   }
   const scopeEls = roots.length ? roots : [document.body];
 
-  const countSelectors = [
-    "span.video_information_count__Y05sI",
-    "span[class*='video_information_count']",
-    "span[class*='live_information_player_count']",
-    "strong[class*='live_information_player_count']",
-    "[class*='live_status'] span",
-    "[class*='LiveStatus'] span"
-  ];
-
-  const labeledClockRe =
-    /스트리밍|streaming|broadcast|방송\s*중|on\s*air|\blive\b|라이브|경과|uptime|진행/i;
-
   const trySpan = (el, requireLabel) => {
     const t = (el.textContent || "").replace(/\u00a0/g, " ").trim();
     if (!t) return null;
-    if (requireLabel && !labeledClockRe.test(t)) return null;
+    if (requireLabel && !CMM_LIVE_STREAMING_CLOCK_LABEL_RE.test(t)) return null;
     const sec = parseClockTextToSec(t);
     if (!Number.isFinite(sec) || sec < 0) return null;
     return sec;
@@ -2541,7 +2762,7 @@ function getLiveElapsedSecondFromDom() {
   const labeled = [];
   const unlabeled = [];
   for (const root of scopeEls) {
-    for (const sel of countSelectors) {
+    for (const sel of CMM_LIVE_STREAMING_COUNT_SELECTORS) {
       let list;
       try {
         list = Array.from(root.querySelectorAll(sel));
@@ -2556,7 +2777,7 @@ function getLiveElapsedSecondFromDom() {
   }
 
   for (const root of scopeEls) {
-    for (const sel of countSelectors) {
+    for (const sel of CMM_LIVE_STREAMING_COUNT_SELECTORS) {
       let list;
       try {
         list = Array.from(root.querySelectorAll(sel));
@@ -3771,10 +3992,13 @@ function openClusterPopover(anchorEl, items, video, sortedSessionEntries, sessio
   });
 
   const onDown = (ev) => {
+    if (isCmmConfirmModalOpen()) return;
+    if (ev.target.closest("#cmm-confirm-modal")) return;
     if (pop.contains(ev.target) || anchorEl.contains(ev.target)) return;
     closeClusterPopover({ releaseMarkerHoverHold: true });
   };
   const onKey = (ev) => {
+    if (ev.key === "Escape" && isCmmConfirmModalOpen()) return;
     if (ev.key === "Escape") closeClusterPopover({ releaseMarkerHoverHold: true });
   };
 
@@ -4053,6 +4277,118 @@ function toast(message) {
   setTimeout(() => el.remove(), 1500);
 }
 
+function isCmmConfirmModalOpen() {
+  const modal = document.getElementById("cmm-confirm-modal");
+  return Boolean(modal && !modal.hidden);
+}
+
+function ensureCmmConfirmModal() {
+  let modal = document.getElementById("cmm-confirm-modal");
+  if (!modal) {
+    modal = document.createElement("div");
+    modal.id = "cmm-confirm-modal";
+    modal.className = "cmm-modal-overlay";
+    modal.hidden = true;
+
+    const panel = document.createElement("div");
+    panel.className = "cmm-modal";
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-modal", "true");
+    panel.setAttribute("aria-labelledby", "cmm-confirm-message");
+
+    const msgEl = document.createElement("p");
+    msgEl.id = "cmm-confirm-message";
+    msgEl.className = "cmm-modal-message";
+
+    const actions = document.createElement("div");
+    actions.className = "cmm-modal-actions";
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.id = "cmm-confirm-cancel";
+    cancelBtn.className = "cmm-btn-secondary";
+    cancelBtn.textContent = "취소";
+
+    const okBtn = document.createElement("button");
+    okBtn.type = "button";
+    okBtn.id = "cmm-confirm-ok";
+    okBtn.className = "cmm-btn-primary";
+    okBtn.textContent = "확인";
+
+    actions.appendChild(cancelBtn);
+    actions.appendChild(okBtn);
+    panel.appendChild(msgEl);
+    panel.appendChild(actions);
+    modal.appendChild(panel);
+  }
+
+  const root = getCmmOverlayMountRoot();
+  if (modal.parentElement !== root) {
+    root.appendChild(modal);
+  }
+  return modal;
+}
+
+function openCmmConfirmModal(message, options = {}) {
+  const okLabel = options.okLabel ?? "확인";
+  const danger = options.danger === true;
+  const confirmOnly = options.confirmOnly === true;
+  return new Promise((resolve) => {
+    const modal = ensureCmmConfirmModal();
+    const msgEl = document.getElementById("cmm-confirm-message");
+    const okBtn = document.getElementById("cmm-confirm-ok");
+    const cancelBtn = document.getElementById("cmm-confirm-cancel");
+    if (!msgEl || !okBtn || !cancelBtn) {
+      resolve(false);
+      return;
+    }
+
+    msgEl.textContent = message;
+    okBtn.textContent = okLabel;
+    okBtn.classList.remove("cmm-btn-danger", "cmm-btn-primary");
+    okBtn.classList.add(danger ? "cmm-btn-danger" : "cmm-btn-primary");
+    cancelBtn.hidden = confirmOnly;
+    modal.hidden = false;
+
+    function cleanup() {
+      modal.hidden = true;
+      cancelBtn.hidden = false;
+      okBtn.removeEventListener("click", onOk);
+      cancelBtn.removeEventListener("click", onCancel);
+      modal.removeEventListener("click", onBackdrop);
+      document.removeEventListener("keydown", onDocKey, true);
+    }
+
+    function onOk() {
+      cleanup();
+      resolve(true);
+    }
+    function onCancel() {
+      cleanup();
+      resolve(false);
+    }
+    function onBackdrop(ev) {
+      if (ev.target === modal) {
+        if (confirmOnly) onOk();
+        else onCancel();
+      }
+    }
+    function onDocKey(ev) {
+      if (ev.key !== "Escape") return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (confirmOnly) onOk();
+      else onCancel();
+    }
+
+    okBtn.addEventListener("click", onOk);
+    cancelBtn.addEventListener("click", onCancel);
+    modal.addEventListener("click", onBackdrop);
+    document.addEventListener("keydown", onDocKey, true);
+    (confirmOnly ? okBtn : cancelBtn).focus();
+  });
+}
+
 /**
  * @param {{ skipInitialDelay?: boolean }} [options]
  * `skipInitialDelay`: 팝업에서 자동 감지를 다시 켠 직후 등, 긴 대기 없이 한 번 읽기.
@@ -4060,7 +4396,11 @@ function toast(message) {
 async function deleteSessionEntry(sessionId, entry) {
   if (!sessionId || !entry) return false;
   const kind = entry.type === "memo" ? "메모" : "기록";
-  if (!window.confirm(`이 ${kind}를 삭제할까요? 되돌릴 수 없습니다.`)) return false;
+  const ok = await openCmmConfirmModal(`이 ${kind}를 삭제할까요? 되돌릴 수 없습니다.`, {
+    okLabel: "삭제",
+    danger: true
+  });
+  if (!ok) return false;
 
   let removed = false;
   await runSessionStorageLocked(async () => {

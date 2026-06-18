@@ -104,6 +104,83 @@
   font-size: 12px;
 }
 
+#cmm-confirm-modal.cmm-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  box-sizing: border-box;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+#cmm-confirm-modal.cmm-modal-overlay[hidden] {
+  display: none;
+}
+
+#cmm-confirm-modal .cmm-modal {
+  width: 100%;
+  max-width: 300px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: #111827;
+  border: 1px solid #374151;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+#cmm-confirm-modal .cmm-modal-message {
+  margin: 0 0 14px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #e5e7eb;
+  white-space: pre-line;
+}
+
+#cmm-confirm-modal .cmm-modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+#cmm-confirm-modal .cmm-modal-actions button {
+  min-width: 72px;
+  height: 32px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  color: #fff;
+}
+
+#cmm-confirm-modal .cmm-btn-secondary {
+  background: #374151;
+  color: #f3f4f6;
+}
+
+#cmm-confirm-modal .cmm-btn-secondary:hover {
+  background: #4b5563;
+}
+
+#cmm-confirm-modal .cmm-btn-primary {
+  background: #2563eb;
+}
+
+#cmm-confirm-modal .cmm-btn-primary:hover {
+  background: #1d4ed8;
+}
+
+#cmm-confirm-modal .cmm-btn-danger {
+  background: #b91c1c;
+}
+
+#cmm-confirm-modal .cmm-btn-danger:hover {
+  background: #991b1b;
+}
+
 /*
   VOD 마커 레이어 — body 고정 오버레이(진행 바 정렬). 표시/숨김은 JS에서 PZP compound와 동기화.
 */
